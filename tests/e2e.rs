@@ -742,10 +742,11 @@ async fn want_by_sha_tolerates_object_check_failure() {
     );
 
     // A git shim that passes everything through except `cat-file`, which fails.
+    // It drains stdin first: exiting unread races the query write into EPIPE.
     let shim = work.path().join("git-shim");
     std::fs::write(
         &shim,
-        "#!/bin/sh\nif [ \"$1\" = cat-file ]; then echo 'fatal: simulated cat-file failure' >&2; exit 1; fi\nexec git \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = cat-file ]; then cat >/dev/null; echo 'fatal: simulated cat-file failure' >&2; exit 1; fi\nexec git \"$@\"\n",
     )
     .unwrap();
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
