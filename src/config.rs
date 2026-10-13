@@ -121,6 +121,17 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_BIG_FILE_THRESHOLD", default_value = "8m")]
     pub big_file_threshold: String,
 
+    /// `pack.threads` for serving: threads per `pack-objects` delta search. Unset
+    /// = git default (one per CPU). Each thread has its own delta window.
+    #[arg(long, env = "GITCACHEPROXY_PACK_THREADS")]
+    pub pack_threads: Option<u32>,
+
+    /// `pack.windowMemory` for serving: delta window memory cap per
+    /// `pack-objects` thread, in git size units (`64m`). Unset = git default
+    /// (unlimited).
+    #[arg(long, env = "GITCACHEPROXY_PACK_WINDOW_MEMORY")]
+    pub pack_window_memory: Option<String>,
+
     /// Log filter directive (e.g. `info`, `git_cache_proxy=debug,tower=warn`).
     /// Overridden by the `RUST_LOG` environment variable when set.
     #[arg(long, env = "GITCACHEPROXY_LOG", default_value = "info")]

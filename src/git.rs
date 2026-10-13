@@ -78,6 +78,10 @@ pub struct GitConfig {
     /// Maximum concurrent `upload-pack` processes (`0` = unlimited). See
     /// `Config::max_concurrent_upload_packs`.
     pub max_upload_packs: usize,
+    /// git `pack.threads` for upload-pack (`None` = git default).
+    pub pack_threads: Option<u32>,
+    /// git `pack.windowMemory` for upload-pack (`None` = git default).
+    pub pack_window_memory: Option<String>,
 }
 
 /// Per-repo serialization point. `fetch_lock` is a `Mutex`, not an `RwLock`, on
@@ -607,6 +611,12 @@ impl GitCache {
         // client's ref list; a hidden ref is still honored as a `want` tip.
         c.arg("-c")
             .arg(format!("uploadpack.hideRefs={PROXY_WANTS_NS}"));
+        if let Some(n) = self.cfg.pack_threads {
+            c.arg("-c").arg(format!("pack.threads={n}"));
+        }
+        if let Some(m) = &self.cfg.pack_window_memory {
+            c.arg("-c").arg(format!("pack.windowMemory={m}"));
+        }
         if let Some(p) = git_protocol {
             c.env("GIT_PROTOCOL", p);
         }
@@ -969,6 +979,8 @@ mod tests {
                 fetch_ttl: Duration::from_secs(60),
                 max_wants: 100,
                 max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
             },
             Arc::new(Metrics::new()),
             None,

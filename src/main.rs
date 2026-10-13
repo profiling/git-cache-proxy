@@ -54,6 +54,8 @@ async fn main() -> Result<()> {
         fetch_ttl: Duration::from_secs(cfg.fetch_ttl_seconds),
         max_wants: cfg.max_wants,
         max_upload_packs: cfg.max_concurrent_upload_packs,
+        pack_threads: cfg.pack_threads,
+        pack_window_memory: cfg.pack_window_memory.clone(),
     };
 
     let metrics = Arc::new(metrics::Metrics::new());

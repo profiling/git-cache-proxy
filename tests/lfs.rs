@@ -340,6 +340,8 @@ fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>)
         fetch_ttl: Duration::from_secs(10),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), Some(idx.clone()))),

@@ -28,6 +28,8 @@ fn state(serve_token: Option<String>) -> AppState {
         fetch_ttl: Duration::from_secs(10),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -218,6 +220,8 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         fetch_ttl: Duration::from_secs(10),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {

@@ -220,6 +220,8 @@ exec git "$@"
                 fetch_ttl,
                 max_wants: 0,
                 max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
             },
             Arc::new(Metrics::new()),
             None,

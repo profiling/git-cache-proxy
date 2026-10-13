@@ -614,6 +614,8 @@ mod tests {
             fetch_ttl: Duration::from_secs(10),
             max_wants: 100,
             max_upload_packs: 0,
+            pack_threads: None,
+            pack_window_memory: None,
         }
     }
 

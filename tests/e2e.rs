@@ -64,6 +64,8 @@ async fn upload_pack_decodes_gzip_encoded_request() {
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -191,6 +193,8 @@ async fn serves_want_by_sha_for_unadvertised_pull_ref() {
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -326,6 +330,8 @@ async fn want_by_sha_fetch_failure_is_recorded_and_degrades_gracefully() {
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -457,6 +463,8 @@ async fn want_by_sha_pins_are_capped_per_mirror() {
         fetch_ttl: Duration::from_secs(0),
         max_wants: 1, // keep at most one pin per mirror
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -600,6 +608,8 @@ async fn caps_want_by_sha_fetch_within_a_single_request() {
         fetch_ttl: Duration::from_secs(0),
         max_wants: 1,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -690,6 +700,8 @@ async fn want_by_sha_pins_are_unlimited_when_max_wants_is_zero() {
         fetch_ttl: Duration::from_secs(0),
         max_wants: 0,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -767,6 +779,8 @@ async fn want_by_sha_tolerates_object_check_failure() {
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -826,6 +840,8 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     // Eviction enabled with an effectively unbounded cap: no mirror is ever
     // evicted, but the on-request index bookkeeping (touch on serve, mark-changed
@@ -1298,6 +1314,8 @@ async fn upload_pack_cap_holds_a_slot_until_the_process_exits() {
             fetch_ttl: Duration::from_secs(0),
             max_wants: 100,
             max_upload_packs: 1,
+            pack_threads: None,
+            pack_window_memory: None,
         },
         Arc::new(Metrics::new()),
         None,
@@ -1320,6 +1338,89 @@ async fn upload_pack_cap_holds_a_slot_until_the_process_exits() {
         .await
         .expect("slot frees once the first upload-pack is killed")
         .unwrap();
+}
+
+/// git rejects a bad `pack.*` value, so a served pack also proves git took them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_pack_runs_with_pack_options() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    git(work.path(), &["init", "-q", "-b", "main", "."]);
+    git(
+        work.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let head = git(work.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    let up = tempfile::tempdir().unwrap();
+    git(
+        work.path(),
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            ".",
+            up.path().join("repo.git").to_str().unwrap(),
+        ],
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let argv_log = dir.path().join("argv.log");
+    let fake_git = dir.path().join("fake-git");
+    std::fs::write(
+        &fake_git,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec git \"$@\"\n",
+            argv_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cache = GitCache::new(
+        GitConfig {
+            git_binary: fake_git.to_str().unwrap().into(),
+            upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
+            fetch_ttl: Duration::from_secs(0),
+            max_wants: 100,
+            max_upload_packs: 0,
+            pack_threads: Some(2),
+            pack_window_memory: Some("64m".into()),
+        },
+        Arc::new(Metrics::new()),
+        None,
+    );
+    let repo = resolve(
+        "repo.git",
+        &format!("file://{}", up.path().display()),
+        &dir.path().join("cache"),
+    )
+    .unwrap();
+    cache.ensure_fresh(&repo, true, b"").await.unwrap();
+
+    let mut request = pkt(&format!("want {head}\n"));
+    request.extend_from_slice(b"0000");
+    request.extend(pkt("done\n"));
+    let stream = cache
+        .upload_pack_rpc(&repo, None, Bytes::from(request))
+        .await
+        .unwrap();
+    let pack = axum::body::to_bytes(Body::from_stream(stream), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        pack.windows(4).any(|w| w == b"PACK"),
+        "no pack in response: {pack:?}"
+    );
+
+    let argv = std::fs::read_to_string(&argv_log).unwrap();
+    let rpc = argv
+        .lines()
+        .find(|l| l.contains("upload-pack --stateless-rpc /"))
+        .unwrap_or_else(|| panic!("no upload-pack rpc in {argv}"));
+    assert!(rpc.contains("-c pack.threads=2"), "{rpc}");
+    assert!(rpc.contains("-c pack.windowMemory=64m"), "{rpc}");
 }
 
 // --- Test helpers ---------------------------------------------------------
@@ -1398,6 +1499,8 @@ async fn start_proxy_with_git(up: &Path, big_file_threshold: &str, git_binary: &
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
         max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),

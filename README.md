@@ -211,6 +211,8 @@ Every flag has an environment-variable equivalent.
 | `--max-wants`            | `GITCACHEPROXY_MAX_WANTS`            | `100`                        | Cap on want-by-SHA pins retained per mirror; oldest pruned beyond it (`0` = unlimited) |
 | `--git-binary`           | `GITCACHEPROXY_GIT_BINARY`           | `git`                        | Path to git                                                                    |
 | `--big-file-threshold`   | `GITCACHEPROXY_BIG_FILE_THRESHOLD`   | `8m`                         | Stream blobs larger than this to disk during upstream clone/fetch instead of holding them in memory, bounding `index-pack` RSS so one very large repo can't OOM the proxy |
+| `--pack-threads`         | `GITCACHEPROXY_PACK_THREADS`         | -                            | git `pack.threads` when serving: delta-search threads per `pack-objects` (unset = one per CPU) |
+| `--pack-window-memory`   | `GITCACHEPROXY_PACK_WINDOW_MEMORY`   | -                            | git `pack.windowMemory` when serving: delta window memory per `pack-objects` thread, e.g. `64m` (unset = unlimited) |
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus - per-repo request and
 upstream counters, cache-size gauges, LFS object hit/miss counters, and
