@@ -64,14 +64,25 @@ pub struct Config {
     /// connections. Excess requests queue until a slot frees. This bounds the
     /// concurrent upstream clone/fetch work a burst can trigger (the slot is held
     /// for the handler, then released before the packfile streams, so it caps
-    /// setup rather than in-flight streaming). `0` = unlimited. Complementary to
-    /// any ingress-level rate limiting.
+    /// setup rather than in-flight streaming; see `max_concurrent_upload_packs`).
+    /// `0` = unlimited. Complementary to any ingress-level rate limiting.
     #[arg(
         long,
         env = "GITCACHEPROXY_MAX_CONCURRENT_REQUESTS",
         default_value_t = 64
     )]
     pub max_concurrent_requests: usize,
+
+    /// Maximum number of `git upload-pack` processes at once, to bound
+    /// `pack-objects` memory on large repos. A slot frees when the process exits,
+    /// so it covers the streamed pack. Excess clones queue while holding a
+    /// `max_concurrent_requests` slot, so set this lower. `0` = unlimited.
+    #[arg(
+        long,
+        env = "GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS",
+        default_value_t = 0
+    )]
+    pub max_concurrent_upload_packs: usize,
 
     /// Maximum size, in MiB, of a decoded `git-upload-pack` request body (the
     /// client's want/have negotiation). Bounds in-memory buffering and defuses a

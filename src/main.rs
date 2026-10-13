@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         big_file_threshold: cfg.big_file_threshold.clone(),
         fetch_ttl: Duration::from_secs(cfg.fetch_ttl_seconds),
         max_wants: cfg.max_wants,
+        max_upload_packs: cfg.max_concurrent_upload_packs,
     };
 
     let metrics = Arc::new(metrics::Metrics::new());

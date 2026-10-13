@@ -27,6 +27,7 @@ fn state(serve_token: Option<String>) -> AppState {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
         max_wants: 100,
+        max_upload_packs: 0,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -216,6 +217,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
         max_wants: 100,
+        max_upload_packs: 0,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {

@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 
@@ -75,6 +75,9 @@ pub struct GitConfig {
     pub fetch_ttl: Duration,
     /// Maximum want-by-SHA pins a mirror retains; oldest pruned beyond it (`0` = unlimited).
     pub max_wants: usize,
+    /// Maximum concurrent `upload-pack` processes (`0` = unlimited). See
+    /// `Config::max_concurrent_upload_packs`.
+    pub max_upload_packs: usize,
 }
 
 /// Per-repo serialization point. `fetch_lock` is a `Mutex`, not an `RwLock`, on
@@ -99,6 +102,8 @@ pub struct GitCache {
     /// When present it is `touch`ed on every request and `record`ed after each
     /// clone/fetch; when absent the eviction machinery is entirely inert.
     index: Option<Arc<crate::evict::CacheIndex>>,
+    /// `None` when `max_upload_packs` is `0` (unlimited).
+    upload_packs: Option<Arc<Semaphore>>,
 }
 
 impl GitCache {
@@ -107,11 +112,14 @@ impl GitCache {
         metrics: Arc<Metrics>,
         index: Option<Arc<crate::evict::CacheIndex>>,
     ) -> Self {
+        let upload_packs =
+            (cfg.max_upload_packs > 0).then(|| Arc::new(Semaphore::new(cfg.max_upload_packs)));
         Self {
             cfg,
             metrics,
             slots: Mutex::new(HashMap::new()),
             index,
+            upload_packs,
         }
     }
 
@@ -258,6 +266,10 @@ impl GitCache {
         git_protocol: Option<&str>,
         body: Bytes,
     ) -> Result<ReaderStream<TimedReader<ChildStdout>>> {
+        let permit = match &self.upload_packs {
+            Some(s) => Some(s.clone().acquire_owned().await.context("upload-pack cap")?),
+            None => None,
+        };
         // Serve duration spans the whole RPC: spawn, negotiation write, and the
         // streamed packfile, recorded when the stream reaches EOF (see `TimedReader`).
         let started = Instant::now();
@@ -280,7 +292,12 @@ impl GitCache {
         // wait for exit without buffering the whole pack. Spawned before the stdin
         // write, so even a request dropped mid-write still kills and reaps the child.
         let (served_tx, served_rx) = oneshot::channel();
-        tokio::spawn(reap_upload_pack(child, served_rx, repo.name.clone()));
+        tokio::spawn(reap_upload_pack(
+            child,
+            served_rx,
+            permit,
+            repo.name.clone(),
+        ));
 
         stdin
             .write_all(&body)
@@ -752,7 +769,13 @@ fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
 
 /// Client gone before EOF (`served` closed unsent): kill the process group, so
 /// `pack-objects` stops packing for nobody.
-async fn reap_upload_pack(mut child: Child, served: oneshot::Receiver<()>, repo: String) {
+/// Holds `_permit` until the child is reaped, so the cap covers the whole pack.
+async fn reap_upload_pack(
+    mut child: Child,
+    served: oneshot::Receiver<()>,
+    _permit: Option<OwnedSemaphorePermit>,
+    repo: String,
+) {
     let status = tokio::select! {
         biased;
         status = child.wait() => status,
@@ -945,6 +968,7 @@ mod tests {
                 big_file_threshold: "8m".into(),
                 fetch_ttl: Duration::from_secs(60),
                 max_wants: 100,
+                max_upload_packs: 0,
             },
             Arc::new(Metrics::new()),
             None,
@@ -1152,7 +1176,7 @@ mod tests {
         drop(tx);
         tokio::time::timeout(
             Duration::from_secs(10),
-            reap_upload_pack(child, rx, "repo.git".into()),
+            reap_upload_pack(child, rx, None, "repo.git".into()),
         )
         .await
         .expect("reaper should kill the leader and return");
@@ -1173,7 +1197,7 @@ mod tests {
         tx.send(()).unwrap();
         let reaped = tokio::time::timeout(
             Duration::from_millis(200),
-            reap_upload_pack(child, rx, "repo.git".into()),
+            reap_upload_pack(child, rx, None, "repo.git".into()),
         )
         .await;
         assert!(reaped.is_err(), "EOF must not kill upload-pack");

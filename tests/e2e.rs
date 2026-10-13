@@ -13,12 +13,13 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use git_cache_proxy::evict::CacheIndex;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
+use git_cache_proxy::repo::resolve;
 use git_cache_proxy::server::{AppState, router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt; // for `oneshot`
@@ -62,6 +63,7 @@ async fn upload_pack_decodes_gzip_encoded_request() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
+        max_upload_packs: 0,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -188,6 +190,7 @@ async fn serves_want_by_sha_for_unadvertised_pull_ref() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
+        max_upload_packs: 0,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -322,6 +325,7 @@ async fn want_by_sha_fetch_failure_is_recorded_and_degrades_gracefully() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
+        max_upload_packs: 0,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -452,6 +456,7 @@ async fn want_by_sha_pins_are_capped_per_mirror() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 1, // keep at most one pin per mirror
+        max_upload_packs: 0,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -594,6 +599,7 @@ async fn caps_want_by_sha_fetch_within_a_single_request() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 1,
+        max_upload_packs: 0,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -683,6 +689,7 @@ async fn want_by_sha_pins_are_unlimited_when_max_wants_is_zero() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 0,
+        max_upload_packs: 0,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -759,6 +766,7 @@ async fn want_by_sha_tolerates_object_check_failure() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
+        max_upload_packs: 0,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -817,6 +825,7 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
+        max_upload_packs: 0,
     };
     // Eviction enabled with an effectively unbounded cap: no mirror is ever
     // evicted, but the on-request index bookkeeping (touch on serve, mark-changed
@@ -1270,6 +1279,49 @@ async fn client_disconnect_kills_upload_pack_process_group() {
     proxy.server.abort();
 }
 
+/// The slot is held until the process exits, not until the handler returns.
+/// Real clock: the paused one would auto-advance past timeouts while git runs.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_pack_cap_holds_a_slot_until_the_process_exits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake_git = dir.path().join("fake-git");
+    std::fs::write(&fake_git, "#!/bin/sh\ncat >/dev/null\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cache = GitCache::new(
+        GitConfig {
+            git_binary: fake_git.to_str().unwrap().into(),
+            upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
+            fetch_ttl: Duration::from_secs(0),
+            max_wants: 100,
+            max_upload_packs: 1,
+        },
+        Arc::new(Metrics::new()),
+        None,
+    );
+    let repo = resolve("repo.git", "file:///unused", dir.path()).unwrap();
+    let rpc = || cache.upload_pack_rpc(&repo, None, Bytes::from_static(b"0000"));
+
+    let first = rpc().await.unwrap();
+    let second = rpc();
+    tokio::pin!(second);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut second)
+            .await
+            .is_err(),
+        "second upload-pack must queue behind the first"
+    );
+
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(10), second)
+        .await
+        .expect("slot frees once the first upload-pack is killed")
+        .unwrap();
+}
+
 // --- Test helpers ---------------------------------------------------------
 
 /// Run a git command in `cwd` with a hermetic identity/config, asserting success.
@@ -1345,6 +1397,7 @@ async fn start_proxy_with_git(up: &Path, big_file_threshold: &str, git_binary: &
         big_file_threshold: big_file_threshold.into(),
         fetch_ttl: Duration::from_secs(0),
         max_wants: 100,
+        max_upload_packs: 0,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),

@@ -205,6 +205,7 @@ Every flag has an environment-variable equivalent.
 | `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
 | `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
+| `--max-concurrent-upload-packs` | `GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS` | `0`            | Max concurrent `git upload-pack` processes, held until each exits; bounds `pack-objects` memory. Set below `--max-concurrent-requests` (`0` = unlimited) |
 | `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
 | `--cache-max-mb`         | `GITCACHEPROXY_CACHE_MAX_MB`         | `0`                          | Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle mirrors when exceeded (`0` = unlimited, no eviction) |
 | `--max-wants`            | `GITCACHEPROXY_MAX_WANTS`            | `100`                        | Cap on want-by-SHA pins retained per mirror; oldest pruned beyond it (`0` = unlimited) |
@@ -269,7 +270,8 @@ explicit before you expose it:
   `--serve-token` is set. That is deliberate for a locked-down CI network; do
   not place it on an untrusted one without a token and TLS.
 - **DoS knobs.** `--max-concurrent-requests` caps concurrent upstream
-  clone/fetch work and `--max-decoded-body-mb` bounds request-body memory
+  clone/fetch work, `--max-concurrent-upload-packs` caps concurrent
+  `pack-objects` memory, and `--max-decoded-body-mb` bounds request-body memory
   (defusing a decompression bomb). `--cache-max-mb` bounds on-disk growth by
   evicting least-recently-used idle mirrors; it defaults to `0` (unlimited), so
   set it - or isolate and monitor the cache volume - on an untrusted network.

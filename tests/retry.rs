@@ -219,6 +219,7 @@ exec git "$@"
                 big_file_threshold: "8m".into(),
                 fetch_ttl,
                 max_wants: 0,
+                max_upload_packs: 0,
             },
             Arc::new(Metrics::new()),
             None,
