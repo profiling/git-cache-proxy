@@ -1191,6 +1191,84 @@ async fn clone_with_low_big_file_threshold_serves_large_blob_intact() {
     proxy.server.abort();
 }
 
+/// A client that hangs up mid-serve must not leave `upload-pack`'s children
+/// running. The fake git stands in for `upload-pack`: it starts a silent
+/// grandchild, as `pack-objects` is while it counts objects, and never writes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_disconnect_kills_upload_pack_process_group() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    git(work.path(), &["init", "-q", "-b", "main", "."]);
+    git(
+        work.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let up = tempfile::tempdir().unwrap();
+    let upstream_repo = up.path().join("repo.git");
+    git(
+        work.path(),
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            ".",
+            upstream_repo.to_str().unwrap(),
+        ],
+    );
+
+    let bin = tempfile::tempdir().unwrap();
+    let pid_file = bin.path().join("grandchild.pid");
+    let fake_git = bin.path().join("fake-git");
+    std::fs::write(
+        &fake_git,
+        format!(
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+             *--advertise-refs*) ;;\n\
+             *upload-pack*) sleep 30 & echo $! > '{}'; wait; exit 0 ;;\n\
+             esac\n\
+             exec git \"$@\"\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let proxy = start_proxy_with_git(up.path(), "8m", fake_git.to_str().unwrap()).await;
+
+    let mut conn = tokio::net::TcpStream::connect(proxy.addr).await.unwrap();
+    conn.write_all(
+        b"POST /repo.git/git-upload-pack HTTP/1.1\r\n\
+          Host: proxy\r\n\
+          Content-Type: application/x-git-upload-pack-request\r\n\
+          Content-Length: 4\r\n\r\n0000",
+    )
+    .await
+    .unwrap();
+    // Wait for the response head, so the hang-up lands while the pack streams.
+    let mut head = [0u8; 12];
+    tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut head))
+        .await
+        .expect("response head before timeout")
+        .unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200");
+    wait_until("fake upload-pack writes its pid file", || pid_file.exists()).await;
+    let pid = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(process_alive(&pid), "grandchild should run before hang-up");
+
+    drop(conn);
+
+    wait_until("grandchild exits after client disconnect", || {
+        !process_alive(&pid)
+    })
+    .await;
+    proxy.server.abort();
+}
+
 // --- Test helpers ---------------------------------------------------------
 
 /// Run a git command in `cwd` with a hermetic identity/config, asserting success.
@@ -1254,10 +1332,14 @@ impl Proxy {
 /// served over `file://`) with the given `core.bigFileThreshold`. Factors out the
 /// inline proxy setup shared by the protocol-coverage tests.
 async fn start_proxy(up: &Path, big_file_threshold: &str) -> Proxy {
+    start_proxy_with_git(up, big_file_threshold, "git").await
+}
+
+async fn start_proxy_with_git(up: &Path, big_file_threshold: &str, git_binary: &str) -> Proxy {
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
+        git_binary: git_binary.into(),
         upstream_auth_header: None,
         big_file_threshold: big_file_threshold.into(),
         fetch_ttl: Duration::from_secs(0),
@@ -1290,6 +1372,26 @@ async fn start_proxy(up: &Path, big_file_threshold: &str) -> Proxy {
         addr,
         server,
         _cache: cache,
+    }
+}
+
+/// `kill -0`: whether `pid` names a live (or not yet reaped) process.
+#[cfg(unix)]
+fn process_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn kill")
+        .success()
+}
+
+/// Poll `cond` against real processes, which a paused tokio clock cannot drive.
+async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

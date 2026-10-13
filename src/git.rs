@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
-use tokio::process::{ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::io::ReaderStream;
 
 use crate::metrics::{Metrics, ServeKind, Status, UpstreamOp};
@@ -264,39 +264,31 @@ impl GitCache {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // Own process group, so a kill also reaches `pack-objects`, which writes
+        // nothing while it counts and compresses and so never gets SIGPIPE.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn().context("spawn git upload-pack")?;
-
         let mut stdin = child.stdin.take().context("upload-pack: no stdin")?;
         let stdout = child.stdout.take().context("upload-pack: no stdout")?;
+
+        // Reap in a detached task: the caller streams stdout, so this method cannot
+        // wait for exit without buffering the whole pack. Spawned before the stdin
+        // write, so even a request dropped mid-write still kills and reaps the child.
+        let (served_tx, served_rx) = oneshot::channel();
+        tokio::spawn(reap_upload_pack(child, served_rx, repo.name.clone()));
+
         stdin
             .write_all(&body)
             .await
             .context("write upload-pack request")?;
         drop(stdin); // EOF so upload-pack starts producing the pack
 
-        // The response is the stdout stream we return; the caller (and ultimately
-        // the HTTP client) drives it to completion by reading to EOF. We can't make
-        // this method block until the child exits without buffering the whole
-        // (potentially multi-GB) packfile in memory first, which defeats streaming.
-        // So we detach a task purely to *reap* the child - dropping `child` after
-        // `take()` neither kills it nor waits on it, leaving a zombie - and to log a
-        // non-zero exit. Its completion carries no result the caller needs: a failed
-        // upload-pack simply truncates the stream, which the git client detects as a
-        // broken pack. This is best-effort observability, not control flow.
-        let name = repo.name.clone();
-        tokio::spawn(async move {
-            match child.wait().await {
-                Ok(s) if !s.success() => {
-                    tracing::warn!(repo = %name, "git upload-pack exited: {s}")
-                }
-                Err(e) => tracing::warn!(repo = %name, "git upload-pack wait failed: {e}"),
-                _ => {}
-            }
-        });
         let timed = TimedReader {
             inner: stdout,
             repo: repo.name.clone(),
             recorder: Some((self.metrics.clone(), started)),
+            served: Some(served_tx),
         };
         Ok(ReaderStream::new(timed))
     }
@@ -746,6 +738,52 @@ fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Client gone before EOF (`served` closed unsent): kill the process group, so
+/// `pack-objects` stops packing for nobody.
+async fn reap_upload_pack(mut child: Child, served: oneshot::Receiver<()>, repo: String) {
+    let status = tokio::select! {
+        biased;
+        status = child.wait() => status,
+        result = served => {
+            if result.is_err() {
+                tracing::debug!(repo = %repo, "client gone before end of pack; killing upload-pack");
+                if let Err(e) = kill_group(&child) {
+                    // Still stop the leader, so the wait below cannot hang.
+                    tracing::warn!(repo = %repo, "kill upload-pack process group failed: {e}");
+                    let _ = child.start_kill();
+                }
+                let _ = child.wait().await;
+                return;
+            }
+            child.wait().await
+        }
+    };
+    match status {
+        Ok(s) if !s.success() => tracing::warn!(repo = %repo, "git upload-pack exited: {s}"),
+        Err(e) => tracing::warn!(repo = %repo, "git upload-pack wait failed: {e}"),
+        _ => {}
+    }
+}
+
+/// Call before reaping: an unreaped child still owns its group ID, so the
+/// signal cannot reach a recycled group.
+#[cfg(unix)]
+fn kill_group(child: &Child) -> std::io::Result<()> {
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    let pid = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| std::io::Error::other("upload-pack already reaped"))?;
+    Ok(kill_process_group(pid, Signal::KILL)?)
+}
+
+#[cfg(not(unix))]
+fn kill_group(_child: &Child) -> std::io::Result<()> {
+    Err(std::io::Error::other("process groups are unix-only"))
+}
+
 /// Wraps `upload-pack`'s stdout to record how long the packfile took to serve.
 /// The duration spans from the RPC starting to the stream reaching EOF - or the
 /// client disconnecting, caught by `Drop` - so it includes the client's read
@@ -755,9 +793,18 @@ pub struct TimedReader<R> {
     inner: R,
     repo: String,
     recorder: Option<(Arc<Metrics>, Instant)>,
+    /// Sent at EOF. Dropped unsent, it makes `reap_upload_pack` kill the child.
+    served: Option<oneshot::Sender<()>>,
 }
 
 impl<R> TimedReader<R> {
+    fn finish(&mut self) {
+        if let Some(tx) = self.served.take() {
+            let _ = tx.send(());
+        }
+        self.record();
+    }
+
     fn record(&mut self) {
         if let Some((metrics, started)) = self.recorder.take() {
             metrics.observe_serve(
@@ -782,7 +829,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for TimedReader<R> {
         if let Poll::Ready(Ok(())) = &poll
             && buf.filled().len() == before
         {
-            this.record();
+            this.finish();
         }
         poll
     }
@@ -1018,6 +1065,7 @@ mod tests {
             inner: &b"packfile bytes"[..],
             repo: "group/foo.git".into(),
             recorder: Some((metrics.clone(), Instant::now())),
+            served: None,
         };
         // Reading to EOF drives the final zero-byte read, which records once.
         let mut sink = Vec::new();
@@ -1027,9 +1075,84 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn timed_reader_signals_served_only_at_eof() {
+        use tokio::io::AsyncReadExt;
+
+        let (tx, rx) = oneshot::channel();
+        let mut reader = timed_reader(tx);
+        reader.read_to_end(&mut Vec::new()).await.unwrap();
+        drop(reader);
+        assert!(rx.await.is_ok(), "EOF must tell the reaper not to kill");
+
+        let (tx, rx) = oneshot::channel();
+        let mut reader = timed_reader(tx);
+        let mut first = [0u8; 4];
+        reader.read_exact(&mut first).await.unwrap();
+        drop(reader);
+        assert!(
+            rx.await.is_err(),
+            "drop before EOF must tell the reaper to kill"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_kills_leader_when_group_kill_fails() {
+        // Without `process_group(0)` no group has the child's ID, so `killpg`
+        // fails and only the leader fallback can end the wait.
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            reap_upload_pack(child, rx, "repo.git".into()),
+        )
+        .await
+        .expect("reaper should kill the leader and return");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_leaves_a_fully_served_child_running() {
+        // `read` blocks until stdin closes. The test holds stdin, because
+        // `Child::wait` closes a stdin the child still owns.
+        let mut child = Command::new("sh")
+            .args(["-c", "read _"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _stdin = child.stdin.take();
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).unwrap();
+        let reaped = tokio::time::timeout(
+            Duration::from_millis(200),
+            reap_upload_pack(child, rx, "repo.git".into()),
+        )
+        .await;
+        assert!(reaped.is_err(), "EOF must not kill upload-pack");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_refuses_a_reaped_child() {
+        let mut child = Command::new("true").spawn().unwrap();
+        child.wait().await.unwrap();
+        assert!(kill_group(&child).is_err());
+    }
+
     /// Collect an iterator of oids into a `HashSet` for order-insensitive assertions
     /// against `parse_wants`.
     fn want_set<I: IntoIterator<Item = String>>(oids: I) -> HashSet<String> {
         oids.into_iter().collect()
+    }
+
+    fn timed_reader(served: oneshot::Sender<()>) -> TimedReader<&'static [u8]> {
+        TimedReader {
+            inner: b"packfile bytes",
+            repo: "group/foo.git".into(),
+            recorder: Some((Arc::new(Metrics::new()), Instant::now())),
+            served: Some(served),
+        }
     }
 }
