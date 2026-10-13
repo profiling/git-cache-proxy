@@ -3,6 +3,18 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.0 (2026-10-13)
+
+### Breaking Changes
+
+- a cache volume written by an older, root-running
+release is not writable by UID 10001, and /readyz returns 503 until it
+is chowned to 10001:10001. On Kubernetes the chart's fsGroup does this.
+
+### Features
+
+- run the image as a non-root user
+
 ## 0.1.15 (2026-10-10)
 
 ### Features
