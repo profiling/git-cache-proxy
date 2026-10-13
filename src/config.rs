@@ -54,7 +54,7 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_SERVE_TOKEN", hide_env_values = true)]
     pub serve_token: Option<String>,
 
-    /// Skip the upstream fetch on `info/refs` if the mirror was refreshed within
+    /// Skip the upstream fetch on `info/refs` if the last fetch started within
     /// this many seconds. Coalesces bursts of clones for the same repo. `0` =
     /// always fetch (freshest, more upstream load).
     #[arg(long, env = "GITCACHEPROXY_FETCH_TTL_SECONDS", default_value_t = 10)]

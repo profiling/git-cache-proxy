@@ -26,13 +26,14 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
+use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 
 use crate::metrics::{Metrics, ServeKind, Status, UpstreamOp};
@@ -70,7 +71,7 @@ pub struct GitConfig {
     /// streamed to disk rather than held in memory, bounding `index-pack` RSS on
     /// very large repos. See `Config::big_file_threshold`.
     pub big_file_threshold: String,
-    /// Skip the upstream fetch if the mirror was refreshed within this window.
+    /// Skip the upstream fetch if the last one started within this window.
     pub fetch_ttl: Duration,
     /// Maximum want-by-SHA pins a mirror retains; oldest pruned beyond it (`0` = unlimited).
     pub max_wants: usize,
@@ -79,7 +80,7 @@ pub struct GitConfig {
 /// Per-repo serialization point. `fetch_lock` is a `Mutex`, not an `RwLock`, on
 /// purpose: it does double duty as (1) the mutual-exclusion point that collapses a
 /// burst of concurrent clones for one repo into a single upstream pull, and (2) the
-/// guard for the last-fetch `Instant` it holds. Both uses need *exclusive* access
+/// guard for the start `Instant` of the last upstream pull. Both uses need *exclusive* access
 /// while a fetch runs - there is no read-only fast path to share - so an `RwLock`
 /// would only add overhead and never grant a concurrent reader.
 struct RepoSlot {
@@ -184,9 +185,12 @@ impl GitCache {
         }
         let mut last = slot.fetch_lock.lock().await;
 
+        // Stamp the start: upstream is read then, so a ref pushed mid-fetch is
+        // missing, and a caller queued behind a slow fetch must see it as stale.
+        let started = Instant::now();
         let outcome = if !repo.cache_dir.join("HEAD").exists() {
             self.clone_mirror(repo).await?;
-            *last = Some(Instant::now());
+            *last = Some(started);
             CacheOutcome::Cloned
         } else if want_fetch
             && match *last {
@@ -195,7 +199,7 @@ impl GitCache {
             }
         {
             self.fetch(repo).await?;
-            *last = Some(Instant::now());
+            *last = Some(started);
             CacheOutcome::Fetched
         } else {
             CacheOutcome::Cached

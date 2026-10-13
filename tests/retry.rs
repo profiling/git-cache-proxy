@@ -128,6 +128,22 @@ async fn concurrent_clients_share_one_retry_sequence() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn waiter_behind_a_slow_fetch_refetches_once_the_ttl_has_passed() {
+    // TTL is measured from the start of a fetch, the moment it reads upstream.
+    // Three retries take 7s, so a caller queued behind them sees stale refs.
+    let f = Fixture::with_ttl(Duration::from_secs(5));
+    f.seed_mirror();
+    f.fail("fetch", 3, "Recv failure: Connection reset by peer");
+    let (a, b) = tokio::join!(
+        f.cache.ensure_fresh(&f.repo, true, b""),
+        f.cache.ensure_fresh(&f.repo, true, b"")
+    );
+    assert!(matches!(a.unwrap(), CacheOutcome::Fetched));
+    assert!(matches!(b.unwrap(), CacheOutcome::Fetched));
+    assert_eq!(5, f.attempts("fetch"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn noisy_stderr_is_drained_and_not_exposed_in_errors() {
     let f = Fixture::new();
     let message = format!(
@@ -154,6 +170,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_ttl(Duration::from_secs(60))
+    }
+
+    fn with_ttl(fetch_ttl: Duration) -> Self {
         let root = tempfile::tempdir().unwrap();
         let upstream = root.path().join("upstream");
         std::fs::create_dir(&upstream).unwrap();
@@ -197,7 +217,7 @@ exec git "$@"
                 git_binary: binary.to_str().unwrap().into(),
                 upstream_auth_header: None,
                 big_file_threshold: "8m".into(),
-                fetch_ttl: Duration::from_secs(60),
+                fetch_ttl,
                 max_wants: 0,
             },
             Arc::new(Metrics::new()),
