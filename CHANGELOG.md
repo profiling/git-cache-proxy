@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.2 (2026-10-14)
+
+### Fixes
+
+- drain cat-file output while writing queries
+
 ## 0.2.1 (2026-10-14)
 
 ### Fixes
