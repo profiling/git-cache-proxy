@@ -514,6 +514,7 @@ impl GitCache {
             .current_dir(&repo.cache_dir)
             .arg("cat-file")
             .arg("--batch-check")
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -525,15 +526,22 @@ impl GitCache {
             query.push_str(oid);
             query.push('\n');
         }
-        stdin
-            .write_all(query.as_bytes())
-            .await
-            .context("write cat-file query")?;
-        drop(stdin); // EOF so cat-file finishes and exits
-        let out = child
-            .wait_with_output()
-            .await
-            .context("git cat-file --batch-check")?;
+        let (_, out) = tokio::try_join!(
+            async {
+                stdin
+                    .write_all(query.as_bytes())
+                    .await
+                    .context("write cat-file query")?;
+                drop(stdin); // EOF so cat-file finishes and exits
+                Ok::<(), anyhow::Error>(())
+            },
+            async {
+                child
+                    .wait_with_output()
+                    .await
+                    .context("git cat-file --batch-check")
+            }
+        )?;
         if !out.status.success() {
             bail!("git cat-file --batch-check failed for {}", repo.name);
         }
@@ -916,6 +924,40 @@ fn parse_wants(body: &[u8]) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_oids_drains_more_than_a_pipe_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let cache = GitCache::new(
+            GitConfig {
+                git_binary: "git".into(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(60),
+                max_wants: 100,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        );
+        let repo = RepoRef {
+            name: "test/repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().to_path_buf(),
+        };
+        let oids = (0..20_000).map(|n| format!("{n:040x}")).collect();
+        let missing =
+            tokio::time::timeout(Duration::from_secs(10), cache.missing_oids(&repo, &oids))
+                .await
+                .expect("cat-file must not deadlock")
+                .unwrap();
+        assert_eq!(missing.len(), oids.len());
+    }
 
     #[test]
     fn upstream_retry_classifies_transient_diagnostics() {
