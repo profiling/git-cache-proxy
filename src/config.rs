@@ -76,7 +76,8 @@ pub struct Config {
     /// Maximum number of `git upload-pack` processes at once, to bound
     /// `pack-objects` memory on large repos. A slot frees when the process exits,
     /// so it covers the streamed pack. Excess clones queue while holding a
-    /// `max_concurrent_requests` slot, so set this lower. `0` = unlimited.
+    /// `max_concurrent_requests` slot, so a full cap can also block `info/refs`.
+    /// `0` = unlimited.
     #[arg(
         long,
         env = "GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS",
