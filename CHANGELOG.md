@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.6 (2026-10-17)
+
+### Features
+
+- add pack.threads and pack.windowMemory options
+
 ## 0.2.5 (2026-10-17)
 
 ### Features
