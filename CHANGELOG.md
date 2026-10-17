@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.4 (2026-10-17)
+
+### Fixes
+
+- start the fetch TTL when the fetch starts
+
 ## 0.2.3 (2026-10-17)
 
 ### Fixes
