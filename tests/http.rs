@@ -306,3 +306,108 @@ async fn metrics_endpoint_renders_recorded_series() {
         "metrics body missing request counter: {body}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn cancelled_advertisements_keep_request_cap_until_exit() {
+    check_cancelled_advertisements(false).await;
+    check_cancelled_advertisements(true).await;
+}
+
+#[cfg(unix)]
+async fn check_cancelled_advertisements(stale: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mirror = root.join("repo.git");
+    std::fs::create_dir_all(&mirror).unwrap();
+    std::fs::write(mirror.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let marker = dir.path().join("started");
+    let gate = dir.path().join("gate");
+    let log = dir.path().join("log");
+    for fifo in [&marker, &gate] {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let wrapper = dir.path().join("git");
+    std::fs::write(&wrapper, format!("#!/bin/sh\nfor arg do\n  if [ \"$arg\" = --advertise-refs ]; then\n    echo started >> '{}'\n    echo started > '{}'\n    read gate < '{}'\n  fi\ndone\nexit 0\n", log.display(), marker.display(), gate.display())).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let cfg = GitConfig {
+        git_binary: wrapper.to_string_lossy().into_owned(),
+        upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
+        fetch_ttl: Duration::from_secs(60),
+        max_wants: 100,
+        max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
+    };
+    let cache = Arc::new(
+        GitCache::new(cfg, metrics.clone(), None)
+            .with_stale(Duration::from_secs(if stale { 60 } else { 0 }), 1)
+            .with_request_limit(1),
+    );
+    let mut st = state(None);
+    st.cache = cache.clone();
+    st.cache_root = root;
+    st.metrics = metrics;
+    st.max_concurrent = 1;
+    let app = router(st);
+
+    for attempt in 1..=3 {
+        let started = tokio::spawn({
+            let marker = marker.clone();
+            async move { tokio::fs::read_to_string(marker).await.unwrap() }
+        });
+        let request = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::get("/repo.git/info/refs?service=git-upload-pack")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+            }
+        });
+        if attempt > 1 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(!request.is_finished());
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap().lines().count(),
+                attempt - 1
+            );
+            let mut writer = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&gate)
+                .await
+                .unwrap();
+            writer.write_all(b"go\n").await.unwrap();
+        }
+        assert_eq!(started.await.unwrap().trim(), "started");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            attempt
+        );
+        request.abort();
+        let _ = request.await;
+    }
+    let mut writer = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&gate)
+        .await
+        .unwrap();
+    writer.write_all(b"go\n").await.unwrap();
+    drop(writer);
+    cache.evict("repo.git", &mirror).await.unwrap();
+    cache.shutdown().await;
+    assert!(!mirror.exists());
+}
