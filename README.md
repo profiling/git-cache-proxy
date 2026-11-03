@@ -80,11 +80,13 @@ without raw upstream stderr or credentials.
 
 Retries stay inside the existing per-repository lock. Each failed clone's staging
 directory is removed before another attempt; an existing fetch mirror is kept.
-Only success updates the freshness timestamp. After retries are exhausted the
-request still fails with 502; stale refs are not served as a fallback. The retry
-budget limits attempts and adds at most seven seconds of backoff; it does not
-impose a new transfer timeout on large repositories. LFS and local upload-pack
-operations are outside this retry policy.
+Only success updates the freshness timestamp. In the default synchronous mode,
+the request fails with 502 after retries are exhausted; stale refs are not served
+as a fallback. A positive `--max-stale-seconds` enables cached reads during a
+background refresh, subject to the configured age limit. The retry budget limits
+attempts and adds at most seven seconds of backoff; it does not impose a new
+transfer timeout on large repositories. LFS and local upload-pack operations are
+outside this retry policy.
 
 If a client `want`s a commit by SHA that the mirror never captured - typically a
 GitHub pull-request merge commit, which lives only under the unadvertised
@@ -218,6 +220,8 @@ Every flag has an environment-variable equivalent.
 | `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | Full HTTP header injected on upstream clone/fetch, e.g. `Authorization: Basic <base64>` (see Auth model); injected via env so it stays out of argv |
 | `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
+| `--max-stale-seconds` | `GITCACHEPROXY_MAX_STALE_SECONDS` | `0` | Maximum age of cached refs served during refresh (`0` = disabled) |
+| `--max-background-fetches` | `GITCACHEPROXY_MAX_BACKGROUND_FETCHES` | `4` | Maximum concurrent background refreshes (at least `1`) |
 | `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
 | `--max-concurrent-upload-packs` | `GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS` | `0`            | Max concurrent `git upload-pack` processes, held until each exits; bounds `pack-objects` memory. Clones waiting for a slot hold a `--max-concurrent-requests` slot (`0` = unlimited) |
 | `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
@@ -227,6 +231,22 @@ Every flag has an environment-variable equivalent.
 | `--big-file-threshold`   | `GITCACHEPROXY_BIG_FILE_THRESHOLD`   | `8m`                         | Stream blobs larger than this to disk during upstream clone/fetch instead of holding them in memory, bounding `index-pack` RSS so one very large repo can't OOM the proxy |
 | `--pack-threads`         | `GITCACHEPROXY_PACK_THREADS`         | -                            | git `pack.threads` when serving: delta-search threads per `pack-objects` (unset = one per CPU) |
 | `--pack-window-memory`   | `GITCACHEPROXY_PACK_WINDOW_MEMORY`   | -                            | git `pack.windowMemory` when serving: delta window memory per `pack-objects` thread, e.g. `64m` (unset = unlimited) |
+
+With a positive `--max-stale-seconds`, an existing mirror can serve cached refs
+while one background fetch updates it. Age is measured from the start of the last
+successful clone or fetch. When its age exceeds the limit, a request waits for a
+refresh or fails. After restart, a mirror's age is unknown and it must refresh
+before serving. Background attempts are limited globally and retried no sooner
+than the fetch TTL, or one second, after the previous attempt completes.
+
+Fetch-triggered automatic Git maintenance is disabled in this mode so a refresh
+does not delete objects just advertised to a client. Active requests are protected
+from proxy eviction until their Git process exits. There is no fixed limit between
+advertisement and upload-pack, so eviction or external Git maintenance between
+requests can remove an old object. A missing SHA is fetched on demand when the
+upstream permits it; this is best effort. In this mode a client with access to a
+mirror can request any object already present in that mirror by SHA, including an
+object no longer reachable from an advertised ref.
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
 
@@ -390,8 +410,8 @@ rely on it.
 
 Not yet implemented:
 
-- A background/scheduled refresh option (today every `info/refs` triggers an
-  on-demand, TTL-coalesced fetch).
+- Scheduled refresh. A positive `--max-stale-seconds` enables request-triggered
+  background refresh; the default remains on-demand synchronous refresh.
 
 **Non-goal: a git-free image.** The `git` binary stays a runtime dependency. The
 proxy serves clients by running `git upload-pack`, and as of 2026 no
