@@ -88,6 +88,17 @@ attempts and adds at most seven seconds of backoff; it does not impose a new
 transfer timeout on large repositories. LFS and local upload-pack operations are
 outside this retry policy.
 
+When serving client clone/fetch requests, the proxy writes negotiation input
+to local git upload-pack while streaming its response to the client.
+Writing the request has a five-minute deadline. The operation also stops
+after 30 minutes without reading response data from Git, including during
+pack generation. Each read resets this inactivity deadline. Once the request
+is written, active transfers have no total duration limit.
+
+These fixed limits are separate from upstream retries. Cancellation, pipe
+errors and timeouts trigger subprocess cleanup. Failures after response
+headers are sent terminate the response body.
+
 If a client `want`s a commit by SHA that the mirror never captured - typically a
 GitHub pull-request merge commit, which lives only under the unadvertised
 `refs/pull/<n>/merge` and so is what `actions/checkout` fetches on a PR build - the
