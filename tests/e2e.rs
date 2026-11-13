@@ -1235,6 +1235,12 @@ async fn clone_with_low_big_file_threshold_serves_large_blob_intact() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_disconnect_kills_upload_pack_process_group() {
+    check_upload_pack_disconnect(false).await;
+    check_upload_pack_disconnect(true).await;
+}
+
+#[cfg(unix)]
+async fn check_upload_pack_disconnect(reset_connection: bool) {
     use std::os::unix::fs::PermissionsExt;
 
     let work = tempfile::tempdir().unwrap();
@@ -1276,14 +1282,12 @@ async fn client_disconnect_kills_upload_pack_process_group() {
     let proxy = start_proxy_with_git(up.path(), "8m", fake_git.to_str().unwrap()).await;
 
     let mut conn = tokio::net::TcpStream::connect(proxy.addr).await.unwrap();
-    conn.write_all(
-        b"POST /repo.git/git-upload-pack HTTP/1.1\r\n\
-          Host: proxy\r\n\
-          Content-Type: application/x-git-upload-pack-request\r\n\
-          Content-Length: 4\r\n\r\n0000",
-    )
-    .await
-    .unwrap();
+    // The fake child never reads stdin: cancellation also stops a blocked writer.
+    let body = vec![b'0'; 1024 * 1024];
+    conn.write_all(format!(
+        "POST /repo.git/git-upload-pack HTTP/1.1\r\nHost: proxy\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\n\r\n", body.len()
+    ).as_bytes()).await.unwrap();
+    conn.write_all(&body).await.unwrap();
     // Wait for the response head, so the hang-up lands while the pack streams.
     let mut head = [0u8; 12];
     tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut head))
@@ -1298,7 +1302,15 @@ async fn client_disconnect_kills_upload_pack_process_group() {
         .to_string();
     assert!(process_alive(&pid), "grandchild should run before hang-up");
 
-    drop(conn);
+    let _fin = if reset_connection {
+        conn.set_zero_linger().unwrap();
+        drop(conn);
+        None
+    } else {
+        // Keep the read half open so unread response headers cannot turn FIN into RST.
+        conn.shutdown().await.unwrap();
+        Some(conn)
+    };
 
     wait_until("grandchild exits after client disconnect", || {
         !process_alive(&pid)
@@ -1509,6 +1521,8 @@ async fn clone_completes_while_background_fetch_is_blocked() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
     tokio::time::advance(Duration::from_secs(2)).await;
+    // Real subprocess and TCP progress must use real time once TTL is advanced.
+    tokio::time::resume();
     let started = tokio::spawn(async move { tokio::fs::read_to_string(marker).await.unwrap() });
     let checkout = dir.path().join("checkout");
     let clone = tokio::spawn({
