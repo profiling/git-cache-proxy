@@ -38,6 +38,8 @@ use tokio::sync::{
 };
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::metrics::{Metrics, ServeKind, Status, UpstreamOp};
 use crate::repo::RepoRef;
@@ -134,6 +136,11 @@ pub struct RequestLease {
 
 #[derive(Clone)]
 pub struct GitCache {
+    shutdown: CancellationToken,
+    // Detached refreshes follow process shutdown, not their triggering request.
+    upstream_shutdown: CancellationToken,
+    owners: TaskTracker,
+    upstream_timeout: Duration,
     cfg: GitConfig,
     metrics: Arc<Metrics>,
     /// Map of repo name -> its serialization slot. A plain `Mutex` (not `RwLock`)
@@ -161,10 +168,15 @@ impl GitCache {
     ) -> Self {
         let upload_packs =
             (cfg.max_upload_packs > 0).then(|| Arc::new(Semaphore::new(cfg.max_upload_packs)));
+        let shutdown = CancellationToken::new();
         Self {
             cfg,
             metrics,
             slots: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: shutdown.clone(),
+            upstream_shutdown: shutdown,
+            owners: TaskTracker::new(),
+            upstream_timeout: Duration::from_secs(3600),
             index,
             upload_packs,
             max_stale: Duration::ZERO,
@@ -208,11 +220,21 @@ impl GitCache {
         body: Bytes,
         cred: Option<&str>,
     ) -> Result<(CacheOutcome, RequestLease)> {
-        let permit = self.request_permit().await?;
-        let cache = self.clone();
+        let mut cache = self.clone();
+        cache.shutdown = self.shutdown.child_token();
+        let _cancel_on_drop = cache.shutdown.clone().drop_guard();
+        let permit = tokio::select! {
+            biased;
+            _ = cache.shutdown.cancelled() => return Err(UpstreamStopped.into()),
+            permit = self.request_permit() => permit?,
+        };
         let cred = cred.map(str::to_owned);
         self.spawn_tracked(async move {
-            let guard = cache.read_guard(&repo).await;
+            let guard = tokio::select! {
+                biased;
+                _ = cache.shutdown.cancelled() => return Err(UpstreamStopped.into()),
+                guard = cache.read_guard(&repo) => guard,
+            };
             let result = cache
                 .ensure_fresh(&repo, want_fetch, &body, cred.as_deref())
                 .await;
@@ -247,6 +269,25 @@ impl GitCache {
             let _ = tx.send(task.await);
         }));
         rx
+    }
+
+    /// Set the total budget for each upstream operation, including retries.
+    pub fn with_upstream_timeout(mut self, timeout: Duration) -> Result<Self> {
+        validate_upstream_timeout(timeout)?;
+        self.upstream_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Reject new upstream work and cancel active operations before HTTP drain.
+    /// Local upload-pack processes continue to drain.
+    pub fn cancel_upstream(&self) {
+        self.upstream_shutdown.cancel();
+        self.owners.close();
+    }
+
+    /// Wait for upstream owners to reap children and release repository locks.
+    pub async fn wait_for_shutdown(&self) {
+        self.owners.wait().await;
     }
 
     async fn slot(&self, name: &str) -> Arc<RepoSlot> {
@@ -325,6 +366,29 @@ impl GitCache {
         body: &[u8],
         cred: Option<&str>,
     ) -> Result<CacheOutcome> {
+        let mut owner = self.clone();
+        owner.shutdown = self.shutdown.child_token();
+        let _cancel_on_drop = owner.shutdown.clone().drop_guard();
+        let repo = repo.clone();
+        let wants = parse_wants(body);
+        let cred = cred.map(str::to_owned);
+        self.owners
+            .spawn(async move {
+                owner
+                    .ensure_fresh_owned(&repo, want_fetch, &wants, cred.as_deref())
+                    .await
+            })
+            .await
+            .context("join upstream owner")?
+    }
+
+    async fn ensure_fresh_owned(
+        &self,
+        repo: &RepoRef,
+        want_fetch: bool,
+        wants: &HashSet<String>,
+        cred: Option<&str>,
+    ) -> Result<CacheOutcome> {
         let slot = self.slot(&repo.name).await;
         // Mark the repo used on every request - a served cache hit counts as much as
         // a fetch - so the eviction index keeps a truthful last-access ordering.
@@ -332,9 +396,13 @@ impl GitCache {
             idx.touch(&repo.name);
         }
         if !self.max_stale.is_zero() {
-            return self.ensure_fresh_stale(repo, &slot, body, cred).await;
+            return self.ensure_fresh_stale(repo, &slot, wants, cred).await;
         }
-        let mut last = slot.fetch_lock.lock().await;
+        let mut last = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => bail!("upstream operation cancelled"),
+            guard = slot.fetch_lock.lock() => guard,
+        };
 
         // Stamp the start: upstream is read then, so a ref pushed mid-fetch is
         // missing, and a caller queued behind a slow fetch must see it as stale.
@@ -358,7 +426,10 @@ impl GitCache {
 
         // Best-effort: on failure, fall through and let upload-pack surface the
         // normal "not our ref" error for any want it still cannot satisfy.
-        if let Err(e) = self.ensure_wanted_oids(repo, body, cred).await {
+        if let Err(e) = self.ensure_wanted_oids(repo, wants, cred).await {
+            if is_auth_failure(&e) || self.shutdown.is_cancelled() || e.is::<UpstreamStopped>() {
+                return Err(e);
+            }
             tracing::warn!(repo = %repo.name, error = %e, "ensure wanted oids failed");
         }
         Ok(outcome)
@@ -368,9 +439,12 @@ impl GitCache {
         &self,
         repo: &RepoRef,
         slot: &Arc<RepoSlot>,
-        body: &[u8],
+        wants: &HashSet<String>,
         cred: Option<&str>,
     ) -> Result<CacheOutcome> {
+        if self.shutdown.is_cancelled() {
+            return Err(UpstreamStopped.into());
+        }
         let exists = repo.cache_dir.join("HEAD").exists();
         let mut state = slot.refresh.lock().await;
         let usable = exists
@@ -390,7 +464,9 @@ impl GitCache {
                 && let Ok(fetch_guard) = slot.fetch_lock.clone().try_lock_owned()
             {
                 state.in_flight = true;
-                let cache = self.clone();
+                let mut cache = self.clone();
+                // A refresh outlives the triggering request, but not process shutdown.
+                cache.shutdown = self.upstream_shutdown.child_token();
                 let repo = repo.clone();
                 let slot = slot.clone();
                 let cred = cred.map(str::to_owned);
@@ -417,12 +493,16 @@ impl GitCache {
                 }));
             }
             drop(state);
-            self.ensure_wants_stale(repo, slot, body, cred).await;
+            self.ensure_wants_stale(repo, slot, wants, cred).await?;
             return Ok(CacheOutcome::Cached);
         }
         drop(state);
 
-        let mut last = slot.fetch_lock.lock().await;
+        let mut last = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return Err(UpstreamStopped.into()),
+            guard = slot.fetch_lock.lock() => guard,
+        };
         let mut state = slot.refresh.lock().await;
         let exists = repo.cache_dir.join("HEAD").exists();
         if exists
@@ -432,7 +512,7 @@ impl GitCache {
         {
             drop(state);
             drop(last);
-            self.ensure_wants_stale(repo, slot, body, cred).await;
+            self.ensure_wants_stale(repo, slot, wants, cred).await?;
             return Ok(CacheOutcome::Cached);
         }
         if exists && state.next_attempt.is_some_and(|t| Instant::now() < t) {
@@ -457,7 +537,7 @@ impl GitCache {
             bail!("refreshed mirror exceeds maximum stale age");
         }
         drop(last);
-        self.ensure_wants_stale(repo, slot, body, cred).await;
+        self.ensure_wants_stale(repo, slot, wants, cred).await?;
         Ok(if exists {
             CacheOutcome::Fetched
         } else {
@@ -473,21 +553,28 @@ impl GitCache {
         &self,
         repo: &RepoRef,
         slot: &RepoSlot,
-        body: &[u8],
+        wants: &HashSet<String>,
         cred: Option<&str>,
-    ) {
-        let wants = parse_wants(body);
+    ) -> Result<()> {
         if wants.is_empty() {
-            return;
+            return Ok(());
         }
-        match self.missing_oids(repo, &wants).await {
-            Ok(missing) if missing.is_empty() => return,
+        match self.missing_oids(repo, wants).await {
+            Ok(missing) if missing.is_empty() => return Ok(()),
             _ => {}
         }
-        let _lock = slot.fetch_lock.lock().await;
-        if let Err(e) = self.ensure_wanted_oids(repo, body, cred).await {
+        let _lock = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return Err(UpstreamStopped.into()),
+            guard = slot.fetch_lock.lock() => guard,
+        };
+        if let Err(e) = self.ensure_wanted_oids(repo, wants, cred).await {
+            if is_auth_failure(&e) || self.shutdown.is_cancelled() || e.is::<UpstreamStopped>() {
+                return Err(e);
+            }
             tracing::warn!(repo = %repo.name, error = %e, "ensure wanted oids failed");
         }
+        Ok(())
     }
 
     /// `git upload-pack --advertise-refs`, wrapped with the smart-HTTP service
@@ -671,7 +758,16 @@ impl GitCache {
             .arg("--quiet")
             .arg(&repo.upstream_url)
             .arg(&tmp);
-        if let Err(error) = run_upstream(&mut cmd, "clone", &repo.name, Some(&tmp)).await {
+        if let Err(error) = run_upstream(
+            &mut cmd,
+            "clone",
+            &repo.name,
+            Some(&tmp),
+            self.upstream_timeout,
+            &self.shutdown,
+        )
+        .await
+        {
             // `-` not the repo name: a failed clone must not mint a per-repo series
             // for an arbitrary client-supplied path (see `metrics`). The failing
             // repo is still named in the returned error, which the caller logs.
@@ -707,7 +803,16 @@ impl GitCache {
             // otherwise drop those refs as "not on upstream" (see `prune_wants`).
             .arg("+refs/*:refs/*")
             .arg(format!("^{PROXY_WANTS_NS}/*"));
-        if let Err(error) = run_upstream(&mut cmd, "fetch", &repo.name, None).await {
+        if let Err(error) = run_upstream(
+            &mut cmd,
+            "fetch",
+            &repo.name,
+            None,
+            self.upstream_timeout,
+            &self.shutdown,
+        )
+        .await
+        {
             self.metrics
                 .record_upstream(UpstreamOp::Fetch, Status::Error, "-");
             return Err(error);
@@ -731,14 +836,13 @@ impl GitCache {
     async fn ensure_wanted_oids(
         &self,
         repo: &RepoRef,
-        body: &[u8],
+        wants: &HashSet<String>,
         cred: Option<&str>,
     ) -> Result<()> {
-        let wants = parse_wants(body);
         if wants.is_empty() {
             return Ok(());
         }
-        let mut missing = self.missing_oids(repo, &wants).await?;
+        let mut missing = self.missing_oids(repo, wants).await?;
         if missing.is_empty() {
             return Ok(());
         }
@@ -771,18 +875,19 @@ impl GitCache {
             // already exist), making the object a `want` tip safe from `git gc`.
             cmd.arg(format!("+{oid}:{PROXY_WANTS_NS}/{oid}"));
         }
-        let status = cmd
-            .status()
-            .await
-            .context("spawn git fetch (want-by-sha)")?;
-        if !status.success() {
-            // Upstream would not serve one of these SHAs (e.g. arbitrary-SHA fetches
-            // are disabled). Leave it: upload-pack will reject the want with "not
-            // our ref".
+        if let Err(error) = run_upstream(
+            &mut cmd,
+            "fetch (want-by-sha)",
+            &repo.name,
+            None,
+            self.upstream_timeout,
+            &self.shutdown,
+        )
+        .await
+        {
             self.metrics
                 .record_upstream(UpstreamOp::WantFetch, Status::Error, "-");
-            tracing::warn!(repo = %repo.name, "want-by-sha fetch from upstream failed");
-            return Ok(());
+            return Err(error);
         }
         self.metrics
             .record_upstream(UpstreamOp::WantFetch, Status::Ok, &repo.name);
@@ -963,6 +1068,25 @@ impl GitCache {
     }
 }
 
+/// Validate the budget for both library configuration and CLI parsing.
+pub fn validate_upstream_timeout(timeout: Duration) -> Result<()> {
+    if timeout.is_zero() || Instant::now().checked_add(timeout).is_none() {
+        bail!("upstream timeout must be positive and fit in a monotonic deadline");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct UpstreamStopped;
+
+impl std::fmt::Display for UpstreamStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upstream operation cancelled or total budget exhausted")
+    }
+}
+
+impl std::error::Error for UpstreamStopped {}
+
 // The caller holds the repository lock throughout retries. Never retry local
 // upload-pack: once its response starts streaming it cannot be replayed safely.
 async fn run_upstream(
@@ -970,34 +1094,63 @@ async fn run_upstream(
     operation: &str,
     repo: &str,
     staging: Option<&Path>,
+    budget: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
+    let deadline = Instant::now() + budget;
     cmd.stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
     for attempt in 0..=MAX_UPSTREAM_RETRIES {
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err(UpstreamStopped.into());
+        }
         if let Some(path) = staging {
             clean_staging(path).await?;
         }
         let mut child = cmd.spawn().context("spawn upstream git")?;
         let mut stderr = child.stderr.take().context("upstream git: no stderr")?;
-        // Drain even after the cap so a noisy child cannot block on its pipe.
-        // Only retain the tail; credentials and raw remote output are never logged.
-        let mut tail = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            let count = stderr
-                .read(&mut chunk)
-                .await
-                .context("read upstream git stderr")?;
-            if count == 0 {
-                break;
+        let operation_result = async {
+            // Drain all output but retain only a bounded diagnostic tail.
+            let mut tail = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = stderr
+                    .read(&mut chunk)
+                    .await
+                    .context("read upstream git stderr")?;
+                if count == 0 {
+                    break;
+                }
+                tail.extend_from_slice(&chunk[..count]);
+                if tail.len() > MAX_UPSTREAM_STDERR_BYTES {
+                    tail.drain(..tail.len() - MAX_UPSTREAM_STDERR_BYTES);
+                }
             }
-            tail.extend_from_slice(&chunk[..count]);
-            if tail.len() > MAX_UPSTREAM_STDERR_BYTES {
-                tail.drain(..tail.len() - MAX_UPSTREAM_STDERR_BYTES);
+            let status = child.wait().await.context("wait for upstream git")?;
+            Ok::<_, anyhow::Error>((status, tail))
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(UpstreamStopped.into()),
+            _ = tokio::time::sleep_until(deadline) => Err(UpstreamStopped.into()),
+            result = operation_result => result,
+        };
+        let (status, tail) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if kill_group(&child).is_err() {
+                    let _ = child.start_kill();
+                }
+                let _ = child.wait().await;
+                if let Some(path) = staging {
+                    clean_staging(path).await?;
+                }
+                return Err(error);
             }
-        }
-        let status = child.wait().await.context("wait for upstream git")?;
+        };
         if status.success() {
             return Ok(());
         }
@@ -1018,7 +1171,7 @@ async fn run_upstream(
                 reason,
                 "retrying upstream git"
             );
-            tokio::time::sleep(*delay).await;
+            wait_upstream_retry(*delay, deadline, cancellation).await?;
             continue;
         }
         // An upstream credential rejection is carried out typed, so a `client`-mode
@@ -1035,6 +1188,19 @@ async fn run_upstream(
         );
     }
     unreachable!("final attempt returns an error or succeeds")
+}
+
+async fn wait_upstream_retry(
+    delay: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(UpstreamStopped.into()),
+        _ = tokio::time::sleep_until(deadline) => Err(UpstreamStopped.into()),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
 }
 
 async fn clean_staging(path: &Path) -> Result<()> {
@@ -1569,6 +1735,386 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_backfill_preserves_auth_and_best_effort_errors() {
+        for (diagnostic, auth) in [
+            ("fatal: Authentication failed", true),
+            ("fatal: not our ref", false),
+        ] {
+            let (dir, repo, oids) = wanted_oids_fixture();
+            let binary = write_failing_git(
+                dir.path(),
+                &format!(
+                    "for arg do\nif [ \"$arg\" = fetch ]; then echo '{diagnostic}' >&2; exit 128; fi\ndone\nexec git \"$@\"\n"
+                ),
+            );
+            let cache = upload_pack_test_cache(binary.to_str().unwrap())
+                .with_stale(Duration::from_secs(60), 1);
+            cache
+                .slot(&repo.name)
+                .await
+                .refresh
+                .lock()
+                .await
+                .last_success = Some(Instant::now());
+            let mut request = pkt_line(&format!("want {}\n", oids[0]));
+            request.extend_from_slice(b"0000");
+            let result = cache.ensure_fresh(&repo, false, &request, None).await;
+            if auth {
+                assert!(is_auth_failure(&result.unwrap_err()));
+            } else {
+                assert!(matches!(result.unwrap(), CacheOutcome::Cached));
+            }
+            cache.shutdown().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_cancels_background_refresh_and_releases_leases() {
+        let (_dir, cache, repo, ready) = stalled_refresh_cache(true);
+        let slot = cache.slot(&repo.name).await;
+        let success = Instant::now() - Duration::from_secs(10);
+        slot.refresh.lock().await.last_success = Some(success);
+        let (outcome, lease) = cache
+            .prepare(repo.clone(), true, Bytes::new(), None)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CacheOutcome::Cached));
+        drop(lease);
+        let pid = tokio::fs::read_to_string(ready).await.unwrap();
+        assert!(slot.refresh.lock().await.in_flight);
+        assert_eq!(cache.background.available_permits(), 0);
+        assert!(slot.lifecycle.try_write().is_err());
+        cache.cancel_upstream();
+        cache.wait_for_shutdown().await;
+        cache.shutdown().await;
+        assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
+        assert_eq!(cache.background.available_permits(), 1);
+        assert!(slot.fetch_lock.try_lock().is_ok());
+        assert!(slot.lifecycle.try_write().is_ok());
+        let state = slot.refresh.lock().await;
+        assert!(!state.in_flight);
+        assert_eq!(state.last_success, Some(success));
+        assert!(cache.prepare(repo, true, Bytes::new(), None).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_stale_preparation_reaps_child_before_releasing_lease() {
+        let (_dir, cache, repo, ready) = stalled_refresh_cache(false);
+        let slot = cache.slot(&repo.name).await;
+        let request = tokio::spawn({
+            let cache = cache.clone();
+            let repo = repo.clone();
+            async move { cache.prepare(repo, true, Bytes::new(), None).await }
+        });
+        let pid = tokio::fs::read_to_string(ready).await.unwrap();
+        assert_eq!(
+            cache.request_setups.as_ref().unwrap().available_permits(),
+            0
+        );
+        assert!(slot.lifecycle.try_write().is_err());
+        assert!(slot.fetch_lock.try_lock().is_err());
+        request.abort();
+        assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+        cache.shutdown().await;
+        assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
+        assert_eq!(
+            cache.request_setups.as_ref().unwrap().available_permits(),
+            1
+        );
+        assert!(slot.lifecycle.try_write().is_ok());
+        assert!(slot.fetch_lock.try_lock().is_ok());
+        cache.cancel_upstream();
+        cache.wait_for_shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_setup_and_stale_mutation_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None)
+            .with_stale(Duration::from_secs(60), 1)
+            .with_request_limit(1);
+        let repo = crate::repo::resolve("repo.git", "https://example.com", dir.path()).unwrap();
+        let slot = cache.slot(&repo.name).await;
+        let guard = slot.fetch_lock.lock().await;
+        let setup_permit = cache
+            .request_setups
+            .as_ref()
+            .unwrap()
+            .acquire()
+            .await
+            .unwrap();
+        let wants = HashSet::new();
+        let fetch = cache.ensure_fresh_owned(&repo, true, &wants, None);
+        let setup = cache.prepare(repo.clone(), true, Bytes::new(), None);
+        let cancel = async {
+            cache.cancel_upstream();
+        };
+        let (fetch, setup, ()) = tokio::join!(fetch, setup, cancel);
+        assert!(fetch.is_err());
+        assert!(setup.is_err());
+        drop(guard);
+        drop(setup_permit);
+        assert!(slot.fetch_lock.try_lock().is_ok());
+        assert_eq!(
+            cache.request_setups.as_ref().unwrap().available_permits(),
+            1
+        );
+        cache.wait_for_shutdown().await;
+        cache.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_wait_obeys_shared_deadline_and_cancellation() {
+        let token = CancellationToken::new();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(3);
+        wait_upstream_retry(Duration::from_secs(2), deadline, &token)
+            .await
+            .unwrap();
+        assert!(
+            wait_upstream_retry(Duration::from_secs(2), deadline, &token)
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(20);
+        let cancel = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(
+            wait_upstream_retry(Duration::from_secs(10), deadline, &token),
+            cancel
+        );
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_repository_waiters_and_rejects_admission() {
+        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let root = tempfile::tempdir().unwrap();
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        let slot = cache.slot(&repo.name).await;
+        let guard = slot.fetch_lock.lock().await;
+        let wants = HashSet::new();
+        let waiter = cache.ensure_fresh_owned(&repo, true, &wants, None);
+        let shutdown = async {
+            cache.cancel_upstream();
+        };
+        let (result, ()) = tokio::join!(waiter, shutdown);
+        assert!(result.is_err());
+        cache.wait_for_shutdown().await;
+        drop(guard);
+        assert!(slot.fetch_lock.try_lock().is_ok());
+        assert!(cache.ensure_fresh(&repo, true, b"", None).await.is_err());
+        cache.wait_for_shutdown().await;
+        assert!(cache.owners.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_shutdown_preserves_active_upload_and_releases_its_permit() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("release");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&release)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let binary = root.path().join("git-wrapper");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\ncat '{}' >/dev/null\nprintf pack\n",
+                release.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = test_config();
+        config.git_binary = binary.to_str().unwrap().into();
+        let cache = GitCache::new(config, Arc::new(Metrics::new()), None);
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        let stream = cache
+            .upload_pack_rpc(&repo, None, Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 0);
+        cache.cancel_upstream();
+        cache.wait_for_shutdown().await;
+        tokio::fs::write(&release, b"").await.unwrap();
+        let mut body = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_util::io::StreamReader::new(stream).read_to_end(&mut body),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(body, b"pack");
+        let permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            cache.upload_packs.as_ref().unwrap().acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(permit);
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+    }
+
+    #[test]
+    fn upstream_budget_rejects_zero_and_overflow() {
+        assert!(validate_upstream_timeout(Duration::ZERO).is_err());
+        assert!(validate_upstream_timeout(Duration::MAX).is_err());
+        assert!(validate_upstream_timeout(Duration::from_secs(3600)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_budget_stops_stalled_and_noisy_commands() {
+        for script in ["sleep 30", "while :; do echo private-diagnostic >&2; done"] {
+            let token = CancellationToken::new();
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            let error = run_upstream(
+                &mut cmd,
+                "test",
+                "test",
+                None,
+                Duration::from_millis(100),
+                &token,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.is::<UpstreamStopped>());
+            assert!(!error.to_string().contains("private-diagnostic"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_cancellation_reaps_child_and_stops_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let pidfile = root.path().join("pids");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pidfile)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo \"$$ $!\" > \"$1\"; wait")
+            .arg("test")
+            .arg(&pidfile);
+        let cancel = async {
+            let pids = tokio::fs::read_to_string(&pidfile).await.unwrap();
+            token.cancel();
+            pids
+        };
+        let (result, pids) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run_upstream(
+                    &mut cmd,
+                    "test",
+                    "test",
+                    None,
+                    Duration::from_secs(30),
+                    &token
+                ),
+                cancel
+            )
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().is::<UpstreamStopped>());
+        let mut pids = pids.split_whitespace();
+        let leader = pids.next().unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{leader}")).exists(),
+            "leader must be reaped"
+        );
+        for pid in pids {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Ok(stat) = tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await {
+                    if stat.split_whitespace().nth(2) == Some("Z") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("descendant must stop after group kill");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_budget_is_shared_across_retry_backoff() {
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo 'Recv failure: Connection reset by peer' >&2; exit 128",
+        ]);
+        let started = Instant::now();
+        let error = run_upstream(
+            &mut cmd,
+            "test",
+            "test",
+            None,
+            Duration::from_millis(100),
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<UpstreamStopped>());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_success_within_budget_and_typed_auth_error() {
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 0.1"]);
+        run_upstream(
+            &mut cmd,
+            "test",
+            "test",
+            None,
+            Duration::from_secs(2),
+            &token,
+        )
+        .await
+        .unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 'fatal: Authentication failed' >&2; exit 128"]);
+        let error = run_upstream(
+            &mut cmd,
+            "test",
+            "test",
+            None,
+            Duration::from_secs(2),
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(is_auth_failure(&error));
+    }
+
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn cancelled_advertisement_holds_mirror_until_child_exits() {
         use std::os::unix::fs::PermissionsExt;
@@ -1657,7 +2203,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn failed_refresh_cools_down_and_expired_mirror_fails() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1700,7 +2246,7 @@ mod tests {
             .lock()
             .await
             .last_success = Some(Instant::now());
-        tokio::time::advance(Duration::from_secs(10)).await;
+        age_refresh(&cache, Duration::from_secs(10)).await;
         assert!(matches!(
             cache.ensure_fresh(&repo, true, &[], None).await.unwrap(),
             CacheOutcome::Cached
@@ -1712,10 +2258,10 @@ mod tests {
                 CacheOutcome::Cached
             ));
         }
-        tokio::time::advance(Duration::from_secs(3)).await;
+        age_refresh(&cache, Duration::from_secs(3)).await;
         assert!(cache.ensure_fresh(&repo, true, &[], None).await.is_err());
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
-        tokio::time::advance(Duration::from_secs(7)).await;
+        age_refresh(&cache, Duration::from_secs(7)).await;
         assert!(cache.ensure_fresh(&repo, true, &[], None).await.is_err());
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
         let restarted = GitCache::new(cache.cfg.clone(), Arc::new(Metrics::new()), None)
@@ -1730,7 +2276,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn stale_reads_share_a_background_fetch() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1831,7 +2377,7 @@ mod tests {
             cache.ensure_fresh(&other, true, &[], None).await.unwrap(),
             CacheOutcome::Cloned
         ));
-        tokio::time::advance(Duration::from_secs(11)).await;
+        age_refresh(&cache, Duration::from_secs(11)).await;
         let started = tokio::spawn({
             let marker = marker.clone();
             async move { tokio::fs::read_to_string(marker).await.unwrap() }
@@ -1852,7 +2398,7 @@ mod tests {
         assert_eq!(started.await.unwrap().trim(), "started");
         trigger.abort();
         let _ = trigger.await;
-        tokio::time::advance(Duration::from_secs(20)).await;
+        age_refresh(&cache, Duration::from_secs(20)).await;
         assert!(matches!(
             cache.ensure_fresh(&other, true, &[], None).await.unwrap(),
             CacheOutcome::Cached
@@ -1871,8 +2417,6 @@ mod tests {
             .prepare(repo.clone(), false, request.clone(), None)
             .await
             .unwrap();
-        // A paused clock can expire lifecycle timers before real Git makes progress.
-        tokio::time::resume();
         let stream = cache
             .upload_pack_rpc_guarded(&repo, None, request, guard)
             .await
@@ -1880,7 +2424,6 @@ mod tests {
         let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
             .await
             .unwrap();
-        tokio::time::pause();
         assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
         let tree = std::process::Command::new("git")
             .current_dir(&work)
@@ -1918,7 +2461,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        tokio::time::advance(Duration::from_secs(70)).await;
+        age_refresh(&cache, Duration::from_secs(70)).await;
         let expired = cache.prepare(repo.clone(), true, Bytes::new(), None);
         tokio::pin!(expired);
         assert!(
@@ -1956,7 +2499,6 @@ mod tests {
         let mut request = pkt_line(&format!("want {}\n", head.trim()));
         request.extend_from_slice(b"0000");
         request.extend(pkt_line("done\n"));
-        tokio::time::resume();
         let stream = cache
             .upload_pack_rpc(&repo, None, Bytes::from(request))
             .await
@@ -1964,7 +2506,6 @@ mod tests {
         let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
             .await
             .unwrap();
-        tokio::time::pause();
         assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
         assert!(
             std::process::Command::new("git")
@@ -2002,7 +2543,6 @@ mod tests {
         let mut request = pkt_line(&format!("want {}\n", head.trim()));
         request.extend_from_slice(b"0000");
         request.extend(pkt_line("done\n"));
-        tokio::time::resume();
         let stream = cache
             .upload_pack_rpc(&repo, None, Bytes::from(request))
             .await
@@ -2010,13 +2550,11 @@ mod tests {
         let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
             .await
             .unwrap();
-        tokio::time::pause();
         assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
         let missing = "f".repeat(40);
         let mut request = pkt_line(&format!("want {missing}\n"));
         request.extend_from_slice(b"0000");
         request.extend(pkt_line("done\n"));
-        tokio::time::resume();
         let stream = cache
             .upload_pack_rpc(&repo, None, Bytes::from(request))
             .await
@@ -2415,7 +2953,7 @@ mod tests {
             .with_writer(logs.reopen().unwrap())
             .finish();
         cache
-            .ensure_wanted_oids(&repo, &request, None)
+            .ensure_wanted_oids(&repo, &parse_wants(&request), None)
             .with_subscriber(subscriber)
             .await
             .unwrap();
@@ -3456,5 +3994,64 @@ mod tests {
             Arc::new(Metrics::new()),
             None,
         )
+    }
+
+    #[cfg(unix)]
+    fn stalled_refresh_cache(
+        seed: bool,
+    ) -> (tempfile::TempDir, GitCache, RepoRef, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&ready)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let binary = dir.path().join("git-wrapper");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = test_config();
+        cfg.git_binary = binary.to_string_lossy().into_owned();
+        cfg.fetch_ttl = Duration::ZERO;
+        let cache = GitCache::new(cfg, Arc::new(Metrics::new()), None)
+            .with_stale(Duration::from_secs(60), 1)
+            .with_request_limit(1);
+        let repo = crate::repo::resolve("repo.git", "https://example.com", dir.path()).unwrap();
+        if seed {
+            std::fs::create_dir(&repo.cache_dir).unwrap();
+            std::fs::write(repo.cache_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+        (dir, cache, repo, ready)
+    }
+
+    async fn age_refresh(cache: &GitCache, age: Duration) {
+        for slot in cache.slots.lock().await.values() {
+            let mut state = slot.refresh.lock().await;
+            state.last_success = state.last_success.map(|time| time - age);
+            state.next_attempt = state.next_attempt.map(|time| time - age);
+        }
+    }
+
+    fn test_config() -> GitConfig {
+        GitConfig {
+            git_binary: "git".into(),
+            upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
+            fetch_ttl: Duration::from_secs(60),
+            max_wants: 0,
+            max_upload_packs: 1,
+            pack_threads: None,
+            pack_window_memory: None,
+        }
     }
 }

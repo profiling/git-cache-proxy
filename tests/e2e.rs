@@ -1703,7 +1703,9 @@ async fn clone_completes_while_background_fetch_is_blocked() {
         .with_stale(Duration::from_secs(60), 1),
     );
     let repo = resolve("repo.git", &upstream, &root).unwrap();
+    tokio::time::resume();
     cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+    tokio::time::pause();
     let state = AppState {
         cache: cache.clone(),
         lfs: Arc::new(Lfs::new(
