@@ -1,6 +1,8 @@
 """Exercise mirror updates against local Git repositories."""
 
 import os
+import re
+from types import SimpleNamespace
 from pathlib import Path
 import subprocess
 import tempfile
@@ -111,6 +113,38 @@ class PullRequestTests(unittest.TestCase):
             ), patch.object(sync_upstream, "run", side_effect=fake_run):
                 sync_upstream.main()
             return commands, output.read_text()
+
+
+class CommitPolicyTests(unittest.TestCase):
+    def test_only_same_fork_official_syncs_are_exempt(self):
+        workflow = (Path(__file__).resolve().parents[1] / "workflows" / "ci.yml").read_text()
+        expression = re.search(
+            r"      - if: >-\n(.*?)        uses: crate-ci/committed", workflow, re.S
+        ).group(1)
+        expression = " ".join(expression.split()).replace("&&", " and ")
+        expression = re.sub(r"!(?!=)", "not ", expression)
+        repository = "profiling/git-cache-proxy"
+        cases = [
+            (repository, repository, "main", "internal/main", "github-actions[bot]", False),
+            (repository, repository, "fix/example", "internal/main", "profiling", True),
+            (repository, "other/git-cache-proxy", "main", "internal/main", "other", True),
+            (repository, repository, "main", "main", "profiling", True),
+            ("other/repo", "other/repo", "main", "internal/main", "other", True),
+            (repository, repository, "fix/example", "internal/main", "dependabot[bot]", False),
+        ]
+        for repo, head_repo, head, base, author, expected in cases:
+            with self.subTest(repo=repo, head_repo=head_repo, head=head, base=base, author=author):
+                github = SimpleNamespace(
+                    repository=repo,
+                    event=SimpleNamespace(pull_request=SimpleNamespace(
+                        user=SimpleNamespace(login=author),
+                        head=SimpleNamespace(repo=SimpleNamespace(full_name=head_repo), ref=head),
+                        base=SimpleNamespace(ref=base),
+                    )),
+                )
+                self.assertEqual(
+                    eval(expression, {"__builtins__": {}}, {"github": github}), expected
+                )
 
 
 if __name__ == "__main__":

@@ -170,5 +170,11 @@ jobs:
       # lines in the body exceed line_length and long dep names exceed
       # subject_length, neither of which is configurable. Exempt them (keyed on
       # PR author so maintainer re-runs stay stable); the job still runs green.
-      - if: github.event.pull_request.user.login != 'dependabot[bot]'
+      # Official syncs preserve imported commit messages verbatim.
+      - if: >-
+          github.event.pull_request.user.login != 'dependabot[bot]' &&
+          !(github.repository == 'profiling/git-cache-proxy' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.head.ref == 'main' &&
+            github.event.pull_request.base.ref == 'internal/main')
         uses: crate-ci/committed@v1.1.12
