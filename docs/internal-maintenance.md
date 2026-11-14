@@ -30,6 +30,9 @@ resolution.
 The workflow summary also reports community PR #67 and #72 status. A merged
 community PR still needs a code comparison, especially after an official squash.
 Keep merge history on internal/main; do not squash or rebase official sync PRs.
+The commit-message check exempts same-repository main-to-internal/main PRs in
+this fork because official commit messages must be preserved. Other PRs retain
+the normal commit-message policy, including its existing Dependabot exemption.
 
 GitHub Actions must be enabled, and the repository must allow Actions to create
 pull requests. The workflow uses GITHUB_TOKEN, with no personal token. Ordinary
