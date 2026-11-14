@@ -115,8 +115,6 @@ pointing at the Service.
 | `clientAuth.signingKey.key` | `signing-key` | Key in that Secret |
 | `config.upstreamTimeoutSeconds` | `3600` | Positive total seconds per upstream operation, including retries |
 | `config.fetchTtlSeconds` | `10` | Skip upstream fetch if refreshed within this window (`0` = always) |
-| `config.maxStaleSeconds` | `0` | Maximum age of cached refs served while refreshing (`0` = disabled) |
-| `config.maxBackgroundFetches` | `4` | Maximum concurrent background refreshes (at least `1`) |
 | `config.cacheMaxMb` | `0` | Cap on on-disk cache, MiB; evicts LRU idle mirrors (`0` = unlimited) |
 | `config.maxConcurrentRequests` | `64` | Max concurrent in-flight requests (`0` = unlimited) |
 | `config.maxDecodedBodyMb` | `512` | Cap on a decoded upload-pack request body, MiB |

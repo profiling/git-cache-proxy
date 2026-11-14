@@ -12,12 +12,7 @@ use tokio::process::Command;
 
 #[tokio::test]
 async fn signals_cancel_upstream_before_http_drain() {
-    for (signal, stale) in [
-        (Signal::TERM, 0),
-        (Signal::INT, 0),
-        (Signal::TERM, 60),
-        (Signal::INT, 60),
-    ] {
+    for signal in [Signal::TERM, Signal::INT] {
         let root = tempfile::tempdir().unwrap();
         let ready = root.path().join("ready");
         assert!(
@@ -45,8 +40,6 @@ async fn signals_cancel_upstream_before_http_drain() {
                 &address.to_string(),
                 "--upstream-timeout-seconds",
                 "10",
-                "--max-stale-seconds",
-                &stale.to_string(),
             ])
             .arg("--cache-root")
             .arg(root.path().join("cache"))
