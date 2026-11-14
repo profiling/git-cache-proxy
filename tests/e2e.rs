@@ -1629,6 +1629,8 @@ async fn clone_completes_while_background_fetch_is_blocked() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
     tokio::time::advance(Duration::from_secs(2)).await;
+    // Real subprocess I/O must not auto-advance upload-pack lifecycle timers.
+    tokio::time::resume();
     let started = tokio::spawn(async move { tokio::fs::read_to_string(marker).await.unwrap() });
     let checkout = dir.path().join("checkout");
     let clone = tokio::spawn({
