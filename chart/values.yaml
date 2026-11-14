@@ -85,6 +85,8 @@ config:
   maxStaleSeconds: 0
   # Maximum simultaneous background refreshes, at least 1.
   maxBackgroundFetches: 4
+  # Total upstream command budget, including retries (positive seconds).
+  upstreamTimeoutSeconds: 3600
   # Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle
   # mirrors when exceeded. 0 = unlimited (no eviction). Set this whenever the
   # cache volume is bounded.

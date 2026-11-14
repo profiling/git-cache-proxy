@@ -95,7 +95,8 @@ async fn main() -> Result<()> {
                 Duration::from_secs(cfg.max_stale_seconds),
                 cfg.max_background_fetches,
             )
-            .with_request_limit(cfg.max_concurrent_requests),
+            .with_request_limit(cfg.max_concurrent_requests)
+            .with_upstream_timeout(Duration::from_secs(cfg.upstream_timeout_seconds))?,
     );
 
     let upstream_base = cfg.upstream.trim_end_matches('/').to_string();
@@ -168,10 +169,16 @@ async fn main() -> Result<()> {
         cfg.cache_root.display(),
     );
 
+    let shutdown_cache = cache.clone();
     axum::serve(listener, server::router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_cache.cancel_upstream();
+        })
         .await
         .context("http server")?;
+
+    cache.wait_for_shutdown().await;
 
     // The server has drained; stop the evictor and wait for it to finish any
     // in-progress eviction before exiting.

@@ -113,6 +113,7 @@ pointing at the Service.
 | `clientAuth.allowHttp` | `false` | Accept a plain http validation endpoint (credentials in cleartext) |
 | `clientAuth.signingKey.existingSecret` | `""` | Secret with the HMAC key signing LFS download grants; empty = a random key per pod |
 | `clientAuth.signingKey.key` | `signing-key` | Key in that Secret |
+| `config.upstreamTimeoutSeconds` | `3600` | Positive total seconds per upstream operation, including retries |
 | `config.fetchTtlSeconds` | `10` | Skip upstream fetch if refreshed within this window (`0` = always) |
 | `config.maxStaleSeconds` | `0` | Maximum age of cached refs served while refreshing (`0` = disabled) |
 | `config.maxBackgroundFetches` | `4` | Maximum concurrent background refreshes (at least `1`) |
