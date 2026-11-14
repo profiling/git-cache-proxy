@@ -238,7 +238,7 @@ async fn dropped_request_cancels_owner_and_releases_repository_lock() {
     .unwrap()
     .unwrap();
     assert!(matches!(result, CacheOutcome::Cloned));
-    f.cache.cancel_upstream();
+    f.cache.shutdown();
     f.cache.wait_for_shutdown().await;
 }
 

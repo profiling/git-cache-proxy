@@ -70,10 +70,6 @@ spec:
               value: {{ .Values.config.upstreamTimeoutSeconds | quote }}
             - name: GITCACHEPROXY_FETCH_TTL_SECONDS
               value: {{ .Values.config.fetchTtlSeconds | quote }}
-            - name: GITCACHEPROXY_MAX_STALE_SECONDS
-              value: {{ .Values.config.maxStaleSeconds | quote }}
-            - name: GITCACHEPROXY_MAX_BACKGROUND_FETCHES
-              value: {{ .Values.config.maxBackgroundFetches | quote }}
             - name: GITCACHEPROXY_CACHE_MAX_MB
               value: {{ .Values.config.cacheMaxMb | quote }}
             - name: GITCACHEPROXY_MAX_CONCURRENT_REQUESTS
