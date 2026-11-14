@@ -2005,6 +2005,7 @@ mod tests {
         let mut request = pkt_line(&format!("want {}\n", head.trim()));
         request.extend_from_slice(b"0000");
         request.extend(pkt_line("done\n"));
+        tokio::time::resume();
         let stream = cache
             .upload_pack_rpc(&repo, None, Bytes::from(request))
             .await
@@ -2018,14 +2019,15 @@ mod tests {
         let mut request = pkt_line(&format!("want {missing}\n"));
         request.extend_from_slice(b"0000");
         request.extend(pkt_line("done\n"));
+        tokio::time::resume();
         let stream = cache
             .upload_pack_rpc(&repo, None, Bytes::from(request))
             .await
             .unwrap();
         let rejected = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
             .await
-            .unwrap();
-        assert!(!rejected.windows(4).any(|bytes| bytes == b"PACK"));
+            .unwrap_err();
+        assert!(rejected.to_string().contains("git upload-pack exited"));
     }
 
     #[tokio::test(start_paused = true)]
