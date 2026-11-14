@@ -1874,6 +1874,8 @@ mod tests {
             .prepare(repo.clone(), false, request.clone(), None)
             .await
             .unwrap();
+        // A paused clock can expire lifecycle timers before real Git makes progress.
+        tokio::time::resume();
         let stream = cache
             .upload_pack_rpc_guarded(&repo, None, request, guard)
             .await
@@ -1881,6 +1883,7 @@ mod tests {
         let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
             .await
             .unwrap();
+        tokio::time::pause();
         assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
         let tree = std::process::Command::new("git")
             .current_dir(&work)
@@ -1956,6 +1959,7 @@ mod tests {
         let mut request = pkt_line(&format!("want {}\n", head.trim()));
         request.extend_from_slice(b"0000");
         request.extend(pkt_line("done\n"));
+        tokio::time::resume();
         let stream = cache
             .upload_pack_rpc(&repo, None, Bytes::from(request))
             .await
@@ -1963,6 +1967,7 @@ mod tests {
         let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
             .await
             .unwrap();
+        tokio::time::pause();
         assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
         assert!(
             std::process::Command::new("git")
@@ -2007,6 +2012,7 @@ mod tests {
         let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
             .await
             .unwrap();
+        tokio::time::pause();
         assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
         let missing = "f".repeat(40);
         let mut request = pkt_line(&format!("want {missing}\n"));
