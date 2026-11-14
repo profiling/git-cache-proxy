@@ -1,0 +1,90 @@
+name: Internal maintenance
+
+on:
+  push:
+    branches: [internal/main]
+  pull_request:
+    branches: [internal/main]
+  schedule:
+    - cron: '23 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: internal-maintenance
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync official main
+    if: >-
+      github.repository == 'profiling/git-cache-proxy' &&
+      github.ref == 'refs/heads/internal/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pending: ${{ steps.sync.outputs.pending }}
+      official_sha: ${{ steps.sync.outputs.official_sha }}
+      internal_sha: ${{ steps.sync.outputs.internal_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Sync and open integration PR
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/sync_upstream.py
+      - name: Report community PR status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for number in 67 72; do
+            gh pr view "$number" --repo rolandjitsu/git-cache-proxy \
+              --json number,state,mergedAt,url >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  validate:
+    name: Validate internal integration
+    needs: sync
+    if: >-
+      always() && github.repository == 'profiling/git-cache-proxy' &&
+      (github.event_name == 'push' || github.event_name == 'pull_request' ||
+       (needs.sync.result == 'success' &&
+        (needs.sync.outputs.pending == 'true' || github.event_name == 'workflow_dispatch')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.internal_sha || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Merge official main for validation
+        if: needs.sync.result == 'success'
+        env:
+          OFFICIAL_SHA: ${{ needs.sync.outputs.official_sha }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-commit --no-ff "$OFFICIAL_SHA"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Test maintenance script
+        run: python3 .github/scripts/test_sync_upstream.py
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --all-features --locked
