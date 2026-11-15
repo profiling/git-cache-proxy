@@ -1292,14 +1292,19 @@ mod tests {
                 .success()
         );
         let binary = root.path().join("git-wrapper");
-        std::fs::write(
-            &binary,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\ncat '{}' >/dev/null\nprintf pack\n",
-                release.display()
-            ),
-        )
-        .unwrap();
+        // Keep the writable descriptor out of parallel test processes' forked children.
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
+                .arg(&binary)
+                .arg(format!(
+                    "#!/bin/sh\ncat >/dev/null\ncat '{}' >/dev/null\nprintf pack\n",
+                    release.display()
+                ))
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = test_config();
         config.git_binary = binary.to_str().unwrap().into();
