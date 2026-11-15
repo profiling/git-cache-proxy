@@ -84,12 +84,15 @@ async fn signals_cancel_upstream_before_http_drain() {
         assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
         let mut pids = pids.split_whitespace();
         let leader = pids.next().unwrap();
-        assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
+        assert!(
+            process_state(leader).await.is_empty(),
+            "leader must be reaped"
+        );
         let descendant = pids.next().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while let Ok(stat) = tokio::fs::read_to_string(format!("/proc/{descendant}/stat")).await
-            {
-                if stat.split_whitespace().nth(2) == Some("Z") {
+            loop {
+                let state = process_state(descendant).await;
+                if state.is_empty() || state.starts_with('Z') {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -98,4 +101,15 @@ async fn signals_cancel_upstream_before_http_drain() {
         .await
         .expect("descendant must stop after group kill");
     }
+}
+
+/// `ps` state of `pid`: empty once reaped, `Z` while a zombie awaits reaping.
+/// `kill -0` reports zombies as alive, and /proc is Linux-only.
+async fn process_state(pid: &str) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }

@@ -1409,13 +1409,14 @@ mod tests {
         let mut pids = pids.split_whitespace();
         let leader = pids.next().unwrap();
         assert!(
-            !Path::new(&format!("/proc/{leader}")).exists(),
+            process_state(leader).await.is_empty(),
             "leader must be reaped"
         );
         for pid in pids {
             tokio::time::timeout(Duration::from_secs(5), async {
-                while let Ok(stat) = tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await {
-                    if stat.split_whitespace().nth(2) == Some("Z") {
+                loop {
+                    let state = process_state(pid).await;
+                    if state.is_empty() || state.starts_with('Z') {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1771,5 +1772,16 @@ mod tests {
             pack_threads: None,
             pack_window_memory: None,
         }
+    }
+
+    /// `ps` state of `pid`: empty once reaped, `Z` while a zombie awaits reaping.
+    /// `kill -0` reports zombies as alive, and /proc is Linux-only.
+    async fn process_state(pid: &str) -> String {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 }
