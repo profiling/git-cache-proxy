@@ -265,7 +265,9 @@ impl GitCache {
             .arg("--advertise-refs")
             .arg(&repo.cache_dir);
         let started = Instant::now();
+        // tokio's `output()` inherits stdin, unlike std's.
         let out = cmd
+            .stdin(Stdio::null())
             .output()
             .await
             .context("spawn git upload-pack --advertise-refs")?;
@@ -534,6 +536,7 @@ impl GitCache {
             .arg("--sort=-creatordate")
             .arg("--format=%(refname)")
             .arg(format!("{PROXY_WANTS_NS}/"))
+            .stdin(Stdio::null())
             .output()
             .await
             .context("spawn git for-each-ref (proxy-wants)")?;
@@ -683,7 +686,8 @@ async fn run_upstream(
     repo: &str,
     staging: Option<&Path>,
 ) -> Result<()> {
-    cmd.stdout(Stdio::null())
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     for attempt in 0..=MAX_UPSTREAM_RETRIES {
@@ -1462,6 +1466,27 @@ mod tests {
             assert!(error.to_string().contains(&repo.name), "{error}");
             assert_eq!(git_test_command(&repo.cache_dir, &["show-ref"]), before);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_interactive_git_commands_do_not_inherit_stdin() {
+        let (dir, repo, _oids) = wanted_oids_fixture();
+        // A terminal or open pipe as stdin makes an inheriting child block; this
+        // asserts the cause directly. It only fails when the test's own stdin is
+        // not /dev/null, so also run the suite with a live stdin.
+        let binary = write_failing_git(
+            dir.path(),
+            "[ /dev/stdin -ef /dev/null ] || { echo 'stdin inherited' >&2; exit 9; }\nexec git \"$@\"\n",
+        );
+        let cache = upload_pack_test_cache(binary.to_str().unwrap());
+        cache.advertise_refs(&repo, None).await.unwrap();
+        cache.prune_wants(&repo).await.unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "[ /dev/stdin -ef /dev/null ]"]);
+        run_upstream(&mut cmd, "test", "repo.git", None)
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]
