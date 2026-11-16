@@ -45,11 +45,15 @@ jobs:
               || { echo "::error::tag $tag must look like internal-v0.2.11-1"; exit 1; }
             [ "${BASH_REMATCH[1]}" = "$version" ] \
               || { echo "::error::tag version ${BASH_REMATCH[1]} != Cargo.toml $version"; exit 1; }
+            echo "IMAGE_TAG=$tag" >> "$GITHUB_ENV"
             echo "CHART_VERSION=${BASH_REMATCH[1]}-internal.${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
             git fetch --no-tags origin internal/main
             git merge-base --is-ancestor "$GITHUB_SHA" origin/internal/main \
               || { echo "::error::$GITHUB_SHA is not on internal/main"; exit 1; }
-          elif [ "$GITHUB_REF" != refs/heads/internal/main ]; then
+          elif [ "$GITHUB_REF" = refs/heads/internal/main ]; then
+            # The branch name has a slash, which is not valid in an image tag.
+            echo "IMAGE_TAG=dry-run" >> "$GITHUB_ENV"
+          else
             echo "::error::manual runs must use internal/main"; exit 1
           fi
       - uses: docker/setup-buildx-action@v4
@@ -69,7 +73,7 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name == 'push' }}
           tags: |
-            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
             ${{ env.IMAGE }}:${{ github.sha }}
           cache-from: type=gha,scope=internal-image
           cache-to: type=gha,mode=max,scope=internal-image
