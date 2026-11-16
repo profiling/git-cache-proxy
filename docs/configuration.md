@@ -19,7 +19,11 @@ Every flag has an environment-variable equivalent.
 | `--auth-ttl-seconds`     | `GITCACHEPROXY_AUTH_TTL_SECONDS`     | `0`                          | Reuse a validation verdict per `(credential, repo)` for this many seconds, so the requests of one clone, or repeated submodule fetches, validate once (`0` = validate every request) |
 | `--auth-max-concurrent`  | `GITCACHEPROXY_AUTH_MAX_CONCURRENT`  | `32`                         | Max token-validation requests in flight; a check waits up to `--auth-timeout-seconds` for a slot, then fails with 503 (`0` = unlimited) |
 | `--auth-allow-http`      | `GITCACHEPROXY_AUTH_ALLOW_HTTP`      | `false`                      | Provider modes: accept a plain `http://` validation endpoint, which sends client credentials in cleartext |
+| `--upstream-timeout-seconds` | `GITCACHEPROXY_UPSTREAM_TIMEOUT_SECONDS` | `3600` | Total budget for each upstream Git operation, including attempts and retry backoff; at least 1 |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
+| `--refresh-interval-seconds` | `GITCACHEPROXY_REFRESH_INTERVAL_SECONDS` | `0` | Background refresh round spacing; 0 disables it, otherwise at least 3600 |
+| `--refresh-active-window-seconds` | `GITCACHEPROXY_REFRESH_ACTIVE_WINDOW_SECONDS` | `604800` | Only refresh mirrors requested within this window; at least 1 when enabled |
+| `--max-concurrent-refreshes` | `GITCACHEPROXY_MAX_CONCURRENT_REFRESHES` | `4` | Maximum background fetches in flight; at least 1 when enabled |
 | `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
 | `--max-concurrent-upload-packs` | `GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS` | `0`            | Max concurrent `git upload-pack` processes, held until each exits; bounds `pack-objects` memory. Clones waiting for a slot hold a `--max-concurrent-requests` slot (`0` = unlimited) |
 | `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
@@ -32,6 +36,41 @@ Every flag has an environment-variable equivalent.
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](./metrics.md)).
 
+
+## Periodic refresh
+
+Refresh is disabled by default. When enabled, the first round starts after one
+interval. Each round selects recently requested mirrors, most recent first.
+Usage is kept only in memory and is reset on restart. Refresh never clones a
+missing mirror, records client use, or promotes a mirror in the eviction LRU.
+Successful background fetches schedule deferred size measurement and capacity
+enforcement without changing LRU order. A TTL hit does not schedule measurement.
+The active-window and concurrency settings have no effect when disabled.
+The interval and its maximum backoff must fit in a monotonic deadline.
+Disabled refresh neither records refresh usage nor locks refresh state on
+requests. Library enabling counts only requests admitted after enabling.
+Usage is recorded after successful cache preparation (ensure_fresh returning
+Ok), including TTL hits, not after the full HTTP response or pack stream.
+Failed, cancelled, and auth-rejected preparation leaves prior successful use
+unchanged. Concurrent completions cannot move the timestamp backwards.
+
+Rounds start every interval, measured from the previous round's start. At the
+round deadline no new repository starts; running fetches finish. The next
+round waits until both that deadline and all previous fetches have completed.
+A deadline skip is not a fetch failure. Refresh shares the request fetch lock
+and TTL. A request arriving during refresh waits for that fetch. Shutdown
+cancels upstream operations and reaps child processes; library users must await
+both request owners and the refresh handle.
+
+Refresh uses only the static upstream auth header, or anonymous access when
+none is configured. It never stores or reuses client credentials. An upstream
+auth rejection blocks further refresh attempts for that mirror until a fetch
+using the same server credential succeeds, or the process restarts. A client
+credential success clears ordinary failure backoff but preserves this mark.
+The first ordinary failure is eligible in the next scheduled round. Repeated
+failures wait interval * 2^(failures - 1) after failure completion, capped at
+32 intervals. Any successful upstream fetch clears
+ordinary failure and backoff state. Request serving ignores refresh backoff.
 
 ## Reusing a cache after changing upstream
 

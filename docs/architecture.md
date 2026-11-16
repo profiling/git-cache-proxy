@@ -13,8 +13,9 @@ works internally, and a throughput benchmark. For usage see the
   replicating every repo, and it can lag the exact commit CI just pushed.
 
 This proxy is **lazy and pull-only**: it caches on first request, and on every
-request runs an incremental `git fetch` before serving - so a client always gets
-the ref it asked for, and nothing is ever pushed or replicated to the origin.
+request checks freshness before serving, using a TTL-coalesced incremental
+`git fetch`. Optional background refresh updates recently used existing mirrors;
+it never discovers or clones repositories. Nothing is pushed to the origin.
 That pull-only property is what makes it viable against a sensitive origin.
 
 ## How it compares
@@ -34,8 +35,9 @@ That pull-only property is what makes it viable against a sensitive origin.
    mirror can lag its refresh interval (`lag`); `--reference` is only as fresh as its local
    seed (`seed`).
 4. Only new objects cross the WAN per request; the bulk history is served from the local mirror.
-5. Never writes to or proactively replicates from the origin - it only ever pulls what a
-   client requested.
+5. Never writes to the origin. With background refresh disabled (the default),
+   upstream pulls serve client requests only. Optional refresh pulls recently used
+   existing mirrors without discovering or cloning repositories.
 6. Works against any unmodified Git smart-HTTP origin. GitLab Geo needs GitLab on both ends.
 
 ## How it works
@@ -70,9 +72,10 @@ Retries stay inside the existing per-repository lock. Each failed clone's stagin
 directory is removed before another attempt; an existing fetch mirror is kept.
 Only success updates the freshness timestamp. After retries are exhausted the
 request still fails with 502; stale refs are not served as a fallback. The retry
-budget limits attempts and adds at most seven seconds of backoff; it does not
-impose a new transfer timeout on large repositories. LFS and local upload-pack
-operations are outside this retry policy.
+budget limits attempts and adds at most seven seconds of backoff. Each upstream
+Git operation also has one `--upstream-timeout-seconds` budget (default `3600`)
+across all attempts and backoff, including background refresh. LFS and local
+upload-pack operations are outside this retry policy and operation budget.
 
 If a client `want`s a commit by SHA that the mirror never captured - typically a
 GitHub pull-request merge commit, which lives only under the unadvertised
@@ -104,6 +107,24 @@ headers are sent terminate the response body. On Unix targets with
 `waitid(NOWAIT)`, leader exit is observed independently of stdout EOF and
 remaining group members are stopped before the leader is reaped. Other
 targets wait for request completion and stdout EOF before observing exit.
+
+### Background refresh
+
+Optional background refresh keeps recently used existing mirrors warm without
+repository discovery or cold clones. See [Periodic refresh configuration](./configuration.md#periodic-refresh)
+for flags, defaults, scheduling, and failure behavior.
+
+Refresh shares the per-repository fetch lock and TTL with requests and eviction.
+Client recency controls eligibility so periodic work cannot keep a mirror active
+forever. Background fetches do not promote the eviction LRU; successful fetches
+mark tracked entries for deferred size measurement and capacity enforcement by
+the existing evictor. Entries already selected for eviction are not recreated.
+
+Round deadlines stop admission while running fetches drain, bounding schedule
+overlap without discarding work already in progress. Shutdown instead cancels
+upstream operations and waits for child cleanup. Refresh uses only the static
+server credential or anonymous access, so scheduling cannot retain or replay
+transient client credentials.
 
 ### git-LFS
 
