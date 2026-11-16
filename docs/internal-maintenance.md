@@ -60,8 +60,14 @@ checks pass. Neither the sync job nor the PR deploys anything.
 
 Deploy an immutable internal tag and image digest from a validated internal
 commit. Record the official base SHA, extra patches, CI run and rollback digest
-with the deployment. No image publisher or production deployment is installed
-by this change.
+with the deployment. No production deployment is installed by this change.
+
+Pushing a tag `internal-v<Cargo version>-<n>` on an internal/main commit runs
+`internal-image.yml`. It builds the official `Dockerfile` unchanged (linux/amd64), pushes `ghcr.io/profiling/git-cache-proxy`
+tagged with the tag and the commit SHA, pushes the Helm chart, and creates a GitHub
+release whose notes give the manifest digest and the CLI changes since the previous
+internal tag. It uses GITHUB_TOKEN only; the crate is not published. Run it manually
+from internal/main to build without publishing.
 
 For new community contributions, branch from origin/main, not internal/main.
 Keep internal-only settings out of community PRs. Integrate each contribution
