@@ -9,15 +9,10 @@ This policy applies to profiling/git-cache-proxy only.
 - Contribution branches: one change per community PR, based on official main.
 - `archive/main-before-internal-20261114`: the original fork main, retained for recovery.
 
-The current internal tree combines official main at `6c4ff31`, PR #72 at
-`205fc39`, PR #76 at `a14cc00`, and PR #77 at `78ce674`. PR #51 is already in
-official main. The upload-pack owner retains the concurrent writer and cleanup
-from #72; upstream operations retain the total budget and cancellation from #77.
-
-Draft PR #67 is excluded until it is ready for reassessment. The previous tree,
-including its earlier integration, is retained at
-`archive/internal-main-with-draft67-8b1e58c`. Removing its behavior uses a normal
-commit on internal/main; existing history and community PR branches are preserved.
+The internal tree is rebuilt on official main with community PR #72 at
+`1d4460b`, #77 at `05eb933` and #79 at `5d66076`. PR #51 and #76 are already in
+official main. Draft PR #67 is excluded. The previous tree is retained at
+`archive/internal-main-with-draft67-8b1e58c`.
 
 ## Automation
 

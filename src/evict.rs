@@ -5,7 +5,8 @@
 //! mirror's size and access order in memory. The request path only ever does O(1)
 //! bookkeeping against it - never disk IO:
 //!   - `touch` on every request (a served cache hit counts as use),
-//!   - `mark_changed` after a clone/fetch, flagging the mirror for (re)measurement.
+//!   - `mark_changed` after a request clone/fetch, promoting and remeasuring,
+//!   - `mark_dirty` after a background fetch, remeasuring without promotion.
 //!
 //! All disk work - measuring a changed mirror's size, and evicting mirrors - runs
 //! in the background [`run`] task, off the critical path, so a client's clone/fetch
@@ -131,6 +132,19 @@ impl CacheIndex {
             }
             inner.dirty.insert(name.to_string());
             self.set_gauges(&inner);
+        }
+        self.work.notify_one();
+    }
+
+    /// Schedule deferred measurement without promoting or recreating an entry.
+    /// A refresh can finish after eviction has already removed its index entry.
+    pub fn mark_dirty(&self, name: &str) {
+        {
+            let mut inner = self.lock();
+            if !inner.cache.contains(name) {
+                return;
+            }
+            inner.dirty.insert(name.to_string());
         }
         self.work.notify_one();
     }
@@ -461,6 +475,151 @@ mod tests {
 
     use crate::git::{GitCache, GitConfig};
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_growth_updates_totals_and_metrics_without_lru_promotion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, idx, repo) = refresh_growth_fixture(
+            tmp.path(),
+            u64::MAX,
+            "printf '%01024d' 0 > objects/pack.data\n",
+        );
+        let handle = cache
+            .start_refresh(Duration::from_secs(3600), Duration::from_secs(604800), 1)
+            .unwrap();
+        cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
+        idx.touch("b.git");
+        let before = idx.totals().0;
+        cache
+            .refresh_repo(
+                &repo,
+                Duration::from_secs(3600),
+                Duration::from_secs(604800),
+                tokio::time::Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), idx.work.notified())
+            .await
+            .unwrap();
+        assert_eq!(idx.lock().cache.peek_lru().unwrap().0, "a.git");
+        maintain(&cache, &idx).await;
+        let actual = measure(&repo.cache_dir).0 + measure(&tmp.path().join("b.git")).0;
+        assert!(actual > before);
+        assert_eq!(idx.totals(), (actual, 2));
+        assert!(
+            idx.metrics
+                .gather()
+                .contains(&format!("gitcacheproxy_cache_bytes {actual}\n"))
+        );
+        assert_eq!(idx.lock().cache.peek_lru().unwrap().0, "a.git");
+        cache.ensure_fresh(&repo, true, b"", None).await.unwrap();
+        assert!(
+            idx.take_dirty().is_empty(),
+            "a TTL hit must not schedule measurement"
+        );
+        cache.shutdown();
+        handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_only_growth_enforces_the_cap_and_evicts_the_same_lru() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, idx, repo) =
+            refresh_growth_fixture(tmp.path(), 256, "printf '%01024d' 0 > objects/pack.data\n");
+        let handle = cache
+            .start_refresh(Duration::from_secs(3600), Duration::from_secs(604800), 1)
+            .unwrap();
+        cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
+        idx.touch("b.git");
+        cache
+            .refresh_repo(
+                &repo,
+                Duration::from_secs(3600),
+                Duration::from_secs(604800),
+                tokio::time::Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
+        assert_eq!(idx.lock().cache.peek_lru().unwrap().0, "a.git");
+        maintain(&cache, &idx).await;
+        assert!(!repo.cache_dir.exists());
+        let remaining = measure(&tmp.path().join("b.git")).0;
+        assert_eq!(idx.totals(), (remaining, 1));
+        let metrics = idx.metrics.gather();
+        assert!(metrics.contains(&format!("gitcacheproxy_cache_bytes {remaining}\n")));
+        assert!(metrics.contains("gitcacheproxy_evictions_total 1\n"));
+        assert!(remaining <= 256);
+        cache.shutdown();
+        handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_finishing_after_victim_selection_does_not_resurrect_the_entry() {
+        use tokio::io::AsyncReadExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, idx, repo) = refresh_growth_fixture(
+            tmp.path(),
+            256,
+            "printf x > started\ncat release >/dev/null\nprintf '%01024d' 0 > objects/pack.data\n",
+        );
+        for name in ["started", "release"] {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(repo.cache_dir.join(name))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let handle = cache
+            .start_refresh(Duration::from_secs(3600), Duration::from_secs(604800), 1)
+            .unwrap();
+        cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
+        idx.touch("b.git");
+        let refresh = cache.refresh_repo(
+            &repo,
+            Duration::from_secs(3600),
+            Duration::from_secs(604800),
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+        );
+        tokio::pin!(refresh);
+        let select_victim = async {
+            tokio::fs::File::open(repo.cache_dir.join("started"))
+                .await
+                .unwrap()
+                .read_exact(&mut [0])
+                .await
+                .unwrap();
+            idx.set_size("a.git", 1024);
+            let victims = idx.take_victims();
+            assert_eq!(victims[0].0, "a.git");
+            let eviction = cache.evict(&repo.name, &repo.cache_dir);
+            tokio::pin!(eviction);
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                assert!(eviction.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::fs::write(repo.cache_dir.join("release"), b"done")
+                .await
+                .unwrap();
+            eviction.await.unwrap();
+        };
+        tokio::join!(refresh, select_victim);
+        assert!(!repo.cache_dir.exists());
+        assert!(!idx.lock().cache.contains("a.git"));
+        assert!(idx.take_dirty().is_empty());
+        let before = idx.totals();
+        idx.set_size("a.git", 9999);
+        idx.mark_dirty("a.git");
+        assert_eq!(idx.totals(), before);
+        assert!(idx.take_dirty().is_empty());
+        cache.shutdown();
+        handle.await.unwrap();
+    }
+
     #[test]
     fn size_accounting_tracks_the_total() {
         let tmp = tempfile::tempdir().unwrap();
@@ -718,6 +877,36 @@ mod tests {
         idx.mark_changed("recloning.git");
         idx.reconcile_missing().await;
         assert_eq!(idx.totals(), (0, 1));
+    }
+
+    #[cfg(unix)]
+    fn refresh_growth_fixture(
+        root: &Path,
+        cap: u64,
+        script: &str,
+    ) -> (GitCache, Arc<CacheIndex>, crate::repo::RepoRef) {
+        use std::os::unix::fs::PermissionsExt;
+        make_mirror(&root.join("a.git"), 10, None);
+        make_mirror(&root.join("b.git"), 10, None);
+        let binary = root.join("git-wrapper");
+        // Avoid writable descriptors inherited by parallel tests' forked children.
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
+                .arg(&binary)
+                .arg(format!("#!/bin/sh\n{script}"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let idx = CacheIndex::new(root.to_path_buf(), cap, metrics.clone());
+        let mut cfg = dummy_cfg();
+        cfg.git_binary = binary.to_str().unwrap().into();
+        let cache = GitCache::new(cfg, metrics, Some(idx.clone()));
+        let repo = crate::repo::resolve("a.git", "https://example.com", root).unwrap();
+        (cache, idx, repo)
     }
 
     fn dummy_cfg() -> GitConfig {
