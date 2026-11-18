@@ -558,20 +558,15 @@ mod tests {
     async fn refresh_finishing_after_victim_selection_does_not_resurrect_the_entry() {
         use tokio::io::AsyncReadExt;
         let tmp = tempfile::tempdir().unwrap();
-        let (cache, idx, repo) = refresh_growth_fixture(
-            tmp.path(),
-            256,
-            "printf x > started\ncat release >/dev/null\nprintf '%01024d' 0 > objects/pack.data\n",
+        let (cache, idx, repo) =
+            refresh_growth_fixture(tmp.path(), 256, "printf x > started\nexec sleep 30\n");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(repo.cache_dir.join("started"))
+                .status()
+                .unwrap()
+                .success()
         );
-        for name in ["started", "release"] {
-            assert!(
-                std::process::Command::new("mkfifo")
-                    .arg(repo.cache_dir.join(name))
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
         let handle = cache
             .start_refresh(Duration::from_secs(3600), Duration::from_secs(604800), 1)
             .unwrap();
@@ -602,9 +597,8 @@ mod tests {
                 std::task::Poll::Ready(())
             })
             .await;
-            tokio::fs::write(repo.cache_dir.join("release"), b"done")
-                .await
-                .unwrap();
+            // Eviction preempts the in-flight refresh fetch instead of waiting
+            // for it to finish naturally; no need to unblock the fake git script.
             eviction.await.unwrap();
         };
         tokio::join!(refresh, select_victim);
