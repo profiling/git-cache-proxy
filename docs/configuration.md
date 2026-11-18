@@ -19,7 +19,7 @@ Every flag has an environment-variable equivalent.
 | `--auth-ttl-seconds`     | `GITCACHEPROXY_AUTH_TTL_SECONDS`     | `0`                          | Reuse a validation verdict per `(credential, repo)` for this many seconds, so the requests of one clone, or repeated submodule fetches, validate once (`0` = validate every request) |
 | `--auth-max-concurrent`  | `GITCACHEPROXY_AUTH_MAX_CONCURRENT`  | `32`                         | Max token-validation requests in flight; a check waits up to `--auth-timeout-seconds` for a slot, then fails with 503 (`0` = unlimited) |
 | `--auth-allow-http`      | `GITCACHEPROXY_AUTH_ALLOW_HTTP`      | `false`                      | Provider modes: accept a plain `http://` validation endpoint, which sends client credentials in cleartext |
-| `--upstream-timeout-seconds` | `GITCACHEPROXY_UPSTREAM_TIMEOUT_SECONDS` | `3600` | Total budget for each upstream Git operation, including attempts and retry backoff; at least 1 |
+| `--upstream-timeout-seconds` | `GITCACHEPROXY_UPSTREAM_TIMEOUT_SECONDS` | `3600`                     | Total seconds per upstream clone, full-ref fetch or SHA backfill, including all attempts and retry delays (must be positive) |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
 | `--refresh-interval-seconds` | `GITCACHEPROXY_REFRESH_INTERVAL_SECONDS` | `0` | Background refresh round spacing; 0 disables it, otherwise at least 3600 |
 | `--refresh-active-window-seconds` | `GITCACHEPROXY_REFRESH_ACTIVE_WINDOW_SECONDS` | `604800` | Only refresh mirrors requested within this window; at least 1 when enabled |
@@ -33,6 +33,8 @@ Every flag has an environment-variable equivalent.
 | `--big-file-threshold`   | `GITCACHEPROXY_BIG_FILE_THRESHOLD`   | `8m`                         | Stream blobs larger than this to disk during upstream clone/fetch instead of holding them in memory, bounding `index-pack` RSS so one very large repo can't OOM the proxy |
 | `--pack-threads`         | `GITCACHEPROXY_PACK_THREADS`         | -                            | git `pack.threads` when serving: delta-search threads per `pack-objects` (unset = one per CPU) |
 | `--pack-window-memory`   | `GITCACHEPROXY_PACK_WINDOW_MEMORY`   | -                            | git `pack.windowMemory` when serving: delta window memory per `pack-objects` thread, e.g. `64m` (unset = unlimited) |
+| `--log`                  | `GITCACHEPROXY_LOG`                  | `info`                       | Log filter directive (e.g. `info`, `git_cache_proxy=debug,tower=warn`). Overridden by `RUST_LOG` |
+| `--log-format`           | `GITCACHEPROXY_LOG_FORMAT`           | `text`                       | Log output format: `text` or `json`                                            |
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](./metrics.md)).
 
