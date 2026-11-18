@@ -124,9 +124,6 @@ Working and end-to-end tested on both Git wire protocol versions - **v2**
 clone, incremental fetch, and push rejection. **git-LFS** is cached too (batch
 API proxied; objects stored content-addressed and integrity-checked).
 
-Early, single-maintainer software: no independent review or wide deployment yet.
-Pin a version and try it against your own setup before relying on it.
-
 Optional background refresh of recently used mirrors is available with
 `--refresh-interval-seconds` (default `0`, disabled; minimum enabled value
 `3600`). See [Configuration](docs/configuration.md#periodic-refresh).
