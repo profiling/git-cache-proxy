@@ -41,38 +41,15 @@ Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](./metrics.md)).
 
 ## Periodic refresh
 
-Refresh is disabled by default. When enabled, the first round starts after one
-interval. Each round selects recently requested mirrors, most recent first.
-Usage is kept only in memory and is reset on restart. Refresh never clones a
-missing mirror, records client use, or promotes a mirror in the eviction LRU.
-Successful background fetches schedule deferred size measurement and capacity
-enforcement without changing LRU order. A TTL hit does not schedule measurement.
-The active-window and concurrency settings have no effect when disabled.
-The interval and its maximum backoff must fit in a monotonic deadline.
-Disabled refresh neither records refresh usage nor locks refresh state on
-requests. Library enabling counts only requests admitted after enabling.
-Usage is recorded after successful cache preparation (ensure_fresh returning
-Ok), including TTL hits, not after the full HTTP response or pack stream.
-Failed, cancelled, and auth-rejected preparation leaves prior successful use
-unchanged. Concurrent completions cannot move the timestamp backwards.
-
-Rounds start every interval, measured from the previous round's start. At the
-round deadline no new repository starts; running fetches finish. The next
-round waits until both that deadline and all previous fetches have completed.
-A deadline skip is not a fetch failure. Refresh shares the request fetch lock
-and TTL. A request arriving during refresh waits for that fetch. Shutdown
-cancels upstream operations and reaps child processes; library users must await
-both request owners and the refresh handle.
-
-Refresh uses only the static upstream auth header, or anonymous access when
-none is configured. It never stores or reuses client credentials. An upstream
-auth rejection blocks further refresh attempts for that mirror until a fetch
-using the same server credential succeeds, or the process restarts. A client
-credential success clears ordinary failure backoff but preserves this mark.
-The first ordinary failure is eligible in the next scheduled round. Repeated
-failures wait interval * 2^(failures - 1) after failure completion, capped at
-32 intervals. Any successful upstream fetch clears
-ordinary failure and backoff state. Request serving ignores refresh backoff.
+Refresh is disabled by default. Set `--refresh-interval-seconds` to at least
+3600 to enable it: the first round starts after one interval and refreshes
+mirrors requested within `--refresh-active-window-seconds`, at most
+`--max-concurrent-refreshes` at a time. The window and concurrency settings
+have no effect when disabled. The interval and its maximum backoff must fit in
+a monotonic deadline. Refresh never clones a missing mirror, and request usage
+is kept in memory only, so it resets on restart. See
+[Background refresh](./architecture.md#background-refresh) for scheduling,
+credential, and failure behavior.
 
 ## Reusing a cache after changing upstream
 

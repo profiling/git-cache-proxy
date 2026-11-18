@@ -126,20 +126,44 @@ targets wait for request completion and stdout EOF before observing exit.
 ### Background refresh
 
 Optional background refresh keeps recently used existing mirrors warm without
-repository discovery or cold clones. See [Periodic refresh configuration](./configuration.md#periodic-refresh)
-for flags, defaults, scheduling, and failure behavior.
+repository discovery or cold clones. See [Periodic refresh](./configuration.md#periodic-refresh)
+for the flags and defaults.
 
-Refresh shares the per-repository fetch lock and TTL with requests and eviction.
-Client recency controls eligibility so periodic work cannot keep a mirror active
-forever. Background fetches do not promote the eviction LRU; successful fetches
-mark tracked entries for deferred size measurement and capacity enforcement by
-the existing evictor. Entries already selected for eviction are not recreated.
+**Eligibility.** Usage is kept only in memory and reset on restart. A request
+counts as use after successful cache preparation (`ensure_fresh` returning
+`Ok`), including TTL hits, not after the full HTTP response or pack stream.
+Failed, cancelled, and auth-rejected preparation leaves prior successful use
+unchanged, and concurrent completions cannot move the timestamp backwards.
+Refresh itself never records use, so periodic work cannot keep a mirror active
+forever. When disabled, requests neither record usage nor lock refresh state;
+library enabling counts only requests admitted after enabling. Each round
+selects mirrors used within the active window, most recent first.
 
-Round deadlines stop admission while running fetches drain, bounding schedule
-overlap without discarding work already in progress. Shutdown instead cancels
-upstream operations and waits for child cleanup. Refresh uses only the static
-server credential or anonymous access, so scheduling cannot retain or replay
-transient client credentials.
+**Scheduling.** Rounds start every interval, measured from the previous round's
+start. At the round deadline no new repository starts and running fetches
+finish; the next round waits until both that deadline and all previous fetches
+have completed. A deadline skip is not a fetch failure. Refresh shares the
+per-repository fetch lock and TTL with requests and eviction, so a request
+arriving during refresh waits for that fetch. Shutdown instead cancels upstream
+operations and reaps child processes; library users must await both request
+owners and the refresh handle.
+
+**Eviction.** Background fetches do not promote the eviction LRU. A successful
+fetch marks the tracked entry for deferred size measurement and capacity
+enforcement by the existing evictor; a TTL hit does not. Entries already
+selected for eviction are not recreated, and an eviction cancels a refresh
+fetch running for that mirror instead of waiting for it.
+
+**Credentials and failures.** Refresh uses only the static upstream auth header,
+or anonymous access when none is configured, so it never stores or reuses
+client credentials. An upstream auth rejection blocks further refresh attempts
+for that mirror until a fetch using the same server credential succeeds, or the
+process restarts; a client credential success clears ordinary failure backoff
+but preserves this mark. The first ordinary failure is eligible in the next
+scheduled round. Repeated failures wait `interval * 2^(failures - 1)` after
+failure completion, capped at 32 intervals. Any successful upstream fetch
+clears ordinary failure and backoff state. Request serving ignores refresh
+backoff.
 
 ### git-LFS
 
