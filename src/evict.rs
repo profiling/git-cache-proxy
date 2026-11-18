@@ -555,7 +555,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn refresh_finishing_after_victim_selection_does_not_resurrect_the_entry() {
+    async fn eviction_after_victim_selection_preempts_refresh_without_resurrecting_entry() {
         use tokio::io::AsyncReadExt;
         let tmp = tempfile::tempdir().unwrap();
         let (cache, idx, repo) =
@@ -589,17 +589,14 @@ mod tests {
             idx.set_size("a.git", 1024);
             let victims = idx.take_victims();
             assert_eq!(victims[0].0, "a.git");
-            let eviction = cache.evict(&repo.name, &repo.cache_dir);
-            tokio::pin!(eviction);
-            std::future::poll_fn(|cx| {
-                use std::future::Future;
-                assert!(eviction.as_mut().poll(cx).is_pending());
-                std::task::Poll::Ready(())
-            })
-            .await;
-            // Eviction preempts the in-flight refresh fetch instead of waiting
-            // for it to finish naturally; no need to unblock the fake git script.
-            eviction.await.unwrap();
+            // The eviction cancels the running refresh instead of waiting it out.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                cache.evict(&repo.name, &repo.cache_dir),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         };
         tokio::join!(refresh, select_victim);
         assert!(!repo.cache_dir.exists());

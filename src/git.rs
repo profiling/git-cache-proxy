@@ -1838,7 +1838,7 @@ mod tests {
         refresh_loop(interval, CancellationToken::new(), round).await;
         let interval = Duration::from_secs(1);
         let token = CancellationToken::new();
-        let refresh = refresh_loop(interval, token, round);
+        let refresh = refresh_loop(interval, token.clone(), round);
         tokio::pin!(refresh);
         std::future::poll_fn(|cx| {
             assert!(refresh.as_mut().poll(cx).is_pending());
@@ -2433,7 +2433,7 @@ mod tests {
             candidates,
             2,
             start + Duration::from_secs(10),
-            token,
+            token.clone(),
             |repo| {
                 let events = events.clone();
                 async move {
@@ -3287,6 +3287,7 @@ mod tests {
             request.extend(pkt_line(&format!("want {oid}\n")));
         }
         request.extend_from_slice(b"0000");
+        let wants = parse_wants(&request);
         let logs = tempfile::NamedTempFile::new().unwrap();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -3294,7 +3295,7 @@ mod tests {
             .with_writer(logs.reopen().unwrap())
             .finish();
         cache
-            .ensure_wanted_oids(&repo, &parse_wants(&request), None)
+            .ensure_wanted_oids(&repo, &wants, None)
             .with_subscriber(subscriber)
             .await
             .unwrap();
@@ -4302,6 +4303,29 @@ mod tests {
             eof: false,
         }
     }
+    fn test_config() -> GitConfig {
+        GitConfig {
+            git_binary: "git".into(),
+            upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
+            fetch_ttl: Duration::from_secs(60),
+            max_wants: 0,
+            max_upload_packs: 1,
+            pack_threads: None,
+            pack_window_memory: None,
+        }
+    }
+
+    /// `ps` state of `pid`: empty once reaped, `Z` while a zombie awaits reaping.
+    /// `kill -0` reports zombies as alive, and /proc is Linux-only.
+    async fn process_state(pid: &str) -> String {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
 
     struct FailingReader;
 
@@ -4330,30 +4354,6 @@ mod tests {
             Arc::new(Metrics::new()),
             None,
         )
-    }
-
-    fn test_config() -> GitConfig {
-        GitConfig {
-            git_binary: "git".into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
-            fetch_ttl: Duration::from_secs(60),
-            max_wants: 0,
-            max_upload_packs: 1,
-            pack_threads: None,
-            pack_window_memory: None,
-        }
-    }
-
-    /// `ps` state of `pid`: empty once reaped, `Z` while a zombie awaits reaping.
-    /// `kill -0` reports zombies as alive, and /proc is Linux-only.
-    async fn process_state(pid: &str) -> String {
-        let out = Command::new("ps")
-            .args(["-o", "stat=", "-p", pid])
-            .output()
-            .await
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
     /// Value of `refresh_total{result}`; 0 when the series was never recorded.
@@ -4418,6 +4418,7 @@ mod tests {
         cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
         (cache, repo)
     }
+
     #[cfg(unix)]
     fn write_test_script(path: &Path, script: &str) {
         // Avoid writable descriptors inherited by parallel tests' forked children.
