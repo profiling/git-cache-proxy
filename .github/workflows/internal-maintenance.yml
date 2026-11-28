@@ -41,14 +41,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/sync_upstream.py
-      - name: Report community PR status
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for number in 67 72; do
-            gh pr view "$number" --repo rolandjitsu/git-cache-proxy \
-              --json number,state,mergedAt,url >> "$GITHUB_STEP_SUMMARY"
-          done
 
   validate:
     name: Validate internal integration

@@ -3,6 +3,54 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.3.0 (2026-11-26)
+
+### Breaking Changes
+
+- upstream_ops_total{result="error"} now counts only
+upstream failures, not cancelled operations.
+
+### Features
+
+- log upstream failures with stderr
+
+### Fixes
+
+- skip cancelled upstream ops
+
+## 0.2.16 (2026-11-24)
+
+### Fixes
+
+- run the proxy under tini to reap orphans
+
+## 0.2.15 (2026-11-24)
+
+### Fixes
+
+- bump url to 2.5.9 to address RUSTSEC-2026-0592
+
+## 0.2.14 (2026-11-21)
+
+### Features
+
+- refresh recently used mirrors in the background
+- count background refresh results
+
+## 0.2.13 (2026-11-16)
+
+### Fixes
+
+- drain upload-pack stdout while writing
+- stop inheriting stdin in git commands
+- report update-ref status on early exit
+
+## 0.2.12 (2026-11-16)
+
+### Features
+
+- bound and cancel upstream operations
+
 ## 0.2.11 (2026-11-14)
 
 ### Fixes

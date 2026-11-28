@@ -12,12 +12,14 @@ use axum::http::{Request, StatusCode};
 use clap::Parser;
 use git_cache_proxy::auth::Auth;
 use git_cache_proxy::config::{Config, UpstreamCredential};
-use git_cache_proxy::git::{GitCache, GitConfig};
+use git_cache_proxy::git::{GitCache, GitConfig, RefreshConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::repo::resolve;
 use git_cache_proxy::server::{AppState, router};
 use tower::ServiceExt;
+
+mod helpers;
 
 #[tokio::test(start_paused = true)]
 async fn refresh_default_disabled_does_not_start_a_task() {
@@ -29,29 +31,33 @@ async fn refresh_default_disabled_does_not_start_a_task() {
     let cache = GitCache::new(
         GitConfig {
             git_binary: "missing-git-must-not-run".into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
             fetch_ttl: Duration::from_secs(10),
-            max_wants: 100,
-            max_upload_packs: 0,
-            pack_threads: None,
-            pack_window_memory: None,
+            refresh: cfg.refresh_config(),
+            ..helpers::test_git_config()
         },
         Arc::new(Metrics::new()),
         None,
     );
-    assert!(
-        cache
-            .start_refresh(
-                Duration::from_secs(cfg.refresh_interval_seconds),
-                Duration::from_secs(cfg.refresh_active_window_seconds),
-                cfg.max_concurrent_refreshes,
-            )
-            .is_none()
-    );
+    assert!(cache.start_refresh().is_none());
     tokio::time::advance(Duration::from_secs(604800)).await;
     cache.shutdown();
     cache.wait_for_shutdown().await;
+}
+
+#[test]
+fn refresh_config_maps_the_enabled_options() {
+    let cfg = Config::try_parse_from([
+        "proxy",
+        "--upstream=https://example.com",
+        "--refresh-interval-seconds=7200",
+        "--refresh-active-window-seconds=86400",
+        "--max-concurrent-refreshes=2",
+    ])
+    .unwrap();
+    let refresh = cfg.refresh_config().unwrap();
+    assert_eq!(refresh.interval, Duration::from_secs(7200));
+    assert_eq!(refresh.active_window, Duration::from_secs(86400));
+    assert_eq!(refresh.concurrency, 2);
 }
 
 #[test]
@@ -146,6 +152,8 @@ async fn background_refresh_pulls_new_upstream_commits_without_a_client_request(
 
     let cache_root = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
+    // The smallest interval the CLI accepts.
+    let interval = Duration::from_secs(3600);
     let cache = Arc::new(GitCache::new(
         GitConfig {
             git_binary: "git".into(),
@@ -156,16 +164,16 @@ async fn background_refresh_pulls_new_upstream_commits_without_a_client_request(
             max_upload_packs: 0,
             pack_threads: None,
             pack_window_memory: None,
+            refresh: Some(RefreshConfig {
+                interval,
+                active_window: Duration::from_secs(86400),
+                concurrency: 1,
+            }),
         },
         metrics.clone(),
         None,
     ));
-    // The smallest interval the CLI accepts. Enable before the request: only
-    // requests admitted afterwards count as use.
-    let interval = Duration::from_secs(3600);
-    let refresher = cache
-        .start_refresh(interval, Duration::from_secs(86400), 1)
-        .unwrap();
+    let refresher = cache.start_refresh().unwrap();
     let app = router(app_state(
         cache.clone(),
         metrics.clone(),

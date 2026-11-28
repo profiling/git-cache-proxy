@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Shared helpers for the suites that exercise per-request token validation:
-//! a mock upstream `info/refs` on a live local socket, and the `github` auth
-//! config that probes it. Each suite pulls it in with `mod helpers;`.
+//! Shared test helpers: a mock upstream `info/refs` on a live local socket, the
+//! `github` auth config that probes it, and log capture. Each suite pulls it in
+//! with `mod helpers;`.
 
 // Each suite compiles its own copy and uses a different subset, so the unused
 // rest is the sharing, not a real gap.
 #![allow(dead_code)]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use git_cache_proxy::auth::AuthConfig;
 use git_cache_proxy::config::AuthProvider;
+use git_cache_proxy::git::GitConfig;
 use tokio::sync::{Mutex, Notify};
 
 /// The signing key the test replicas share, long enough for HMAC-SHA256.
@@ -150,6 +152,23 @@ pub async fn spawn_validator_with(reply: Reply) -> (String, Arc<Mutex<Vec<Hit>>>
     (format!("http://{addr}"), hits, arrived)
 }
 
+/// A `GitConfig` for tests: the real `git`, no upstream credential, no upload-pack
+/// cap and a zero fetch TTL (every request fetches). Override what a test needs
+/// with struct update syntax, so a new field is added here and not at every site.
+pub fn test_git_config() -> GitConfig {
+    GitConfig {
+        git_binary: "git".into(),
+        upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
+        fetch_ttl: Duration::ZERO,
+        max_wants: 100,
+        max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
+        refresh: None,
+    }
+}
+
 /// A `github` provider config probing the mock at `base` as its upstream, with
 /// its verdict reused for `ttl_secs` (0: revalidated on every request).
 pub fn github_auth_config(base: &str, ttl_secs: u64) -> AuthConfig {
@@ -166,5 +185,56 @@ pub fn github_auth_config(base: &str, ttl_secs: u64) -> AuthConfig {
         // The mocks speak plain http on loopback.
         allow_http: true,
         upstream_base: base.to_string(),
+    }
+}
+
+/// Write an executable-to-be script through a short-lived `sh`, so this process
+/// never holds a writable descriptor for it. The tests run on parallel threads:
+/// a child forked by another one while the descriptor is open inherits it, and
+/// a later `exec` of the script then fails with "Text file busy".
+pub fn write_test_script(path: &Path, script: impl AsRef<str>) {
+    assert!(
+        std::process::Command::new("sh")
+            .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
+            .arg(path)
+            .arg(script.as_ref())
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+/// Capture this thread's log events; `#[tokio::test]` runs spawned tasks on it.
+pub struct Logs {
+    file: tempfile::NamedTempFile,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl Logs {
+    pub fn capture() -> Self {
+        // A global subscriber that wants every callsite: without one, a test thread
+        // with no subscriber can cache a callsite as disabled for all threads.
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(file.reopen().unwrap())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        Self { file, _guard }
+    }
+
+    pub fn read(&self) -> String {
+        std::fs::read_to_string(self.file.path()).unwrap()
+    }
+
+    pub fn failures(&self) -> Vec<String> {
+        self.read()
+            .lines()
+            .filter(|line| line.contains("upstream operation failed"))
+            .map(str::to_owned)
+            .collect()
     }
 }

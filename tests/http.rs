@@ -16,7 +16,10 @@ use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::server::{AppState, router};
+use helpers::Logs;
 use tower::ServiceExt; // for `oneshot`
+
+mod helpers;
 
 #[tokio::test]
 async fn health_endpoints_return_ok() {
@@ -182,17 +185,12 @@ async fn upload_pack_rejects_undecodable_body() {
 async fn upstream_failure_returns_bad_gateway_and_records_error() {
     // A real (but doomed) clone: the upstream points at a path that does not
     // exist, so `git clone --mirror` fails and the request surfaces a 502.
+    let logs = Logs::capture();
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
+        ..helpers::test_git_config()
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -216,6 +214,12 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
 
     let resp = get(st, "/missing.git/info/refs?service=git-upload-pack").await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+    // Logged once, where the clone failed; the handler does not repeat it.
+    let logs = logs.read();
+    assert_eq!(1, logs.matches(" WARN ").count(), "{logs}");
+    assert!(logs.contains("upstream operation failed"), "{logs}");
+    assert!(logs.contains("repo=\"missing.git\""), "{logs}");
 
     let scraped = metrics.gather();
     // A failed clone records under the `-` sentinel, not the client-supplied path,
@@ -244,14 +248,8 @@ async fn upload_pack_upstream_failure_returns_bad_gateway() {
     let metrics = Arc::new(Metrics::new());
     let upstream = "file:///nonexistent/git-cache-proxy-upstream";
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
+        ..helpers::test_git_config()
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -282,6 +280,98 @@ async fn upload_pack_upstream_failure_returns_bad_gateway() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn upload_pack_local_failure_is_logged_by_the_handler() {
+    // The cache root is a file, so creating the mirror's parent fails before any
+    // upstream git runs: a local error the handler logs, not the git layer.
+    let logs = Logs::capture();
+    let root = tempfile::NamedTempFile::new().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let upstream = "file:///nonexistent/git-cache-proxy-upstream";
+    let cfg = GitConfig {
+        fetch_ttl: Duration::from_secs(10),
+        ..helpers::test_git_config()
+    };
+    let lfs = Arc::new(Lfs::new(
+        LfsConfig {
+            upstream_base: upstream.into(),
+            cache_root: root.path().to_path_buf(),
+            upstream_auth_header: None,
+        },
+        None,
+    ));
+    let st = AppState {
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs,
+        upstream_base: upstream.into(),
+        cache_root: root.path().to_path_buf(),
+        auth: anon_auth(),
+        upstream_credential: UpstreamCredential::Static,
+        max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 0,
+        metrics,
+    };
+
+    let resp = router(st)
+        .oneshot(
+            Request::post("/missing.git/git-upload-pack")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let logs = logs.read();
+    assert_eq!(1, logs.matches(" WARN ").count(), "{logs}");
+    assert!(logs.contains("ensure mirror exists failed"), "{logs}");
+    assert!(logs.contains("create cache parent"), "{logs}");
+}
+
+#[tokio::test]
+async fn unspawnable_git_is_logged_by_the_handler() {
+    // git cannot start, so the clone fails with no upstream diagnostic to
+    // classify: it still counts as an upstream error, and the handler logs it.
+    let logs = Logs::capture();
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let upstream = "file:///nonexistent/git-cache-proxy-upstream";
+    let cfg = GitConfig {
+        git_binary: cache.path().join("missing-git").to_str().unwrap().into(),
+        fetch_ttl: Duration::from_secs(10),
+        ..helpers::test_git_config()
+    };
+    let lfs = Arc::new(Lfs::new(
+        LfsConfig {
+            upstream_base: upstream.into(),
+            cache_root: cache.path().to_path_buf(),
+            upstream_auth_header: None,
+        },
+        None,
+    ));
+    let st = AppState {
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs,
+        upstream_base: upstream.into(),
+        cache_root: cache.path().to_path_buf(),
+        auth: anon_auth(),
+        upstream_credential: UpstreamCredential::Static,
+        max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 0,
+        metrics: metrics.clone(),
+    };
+
+    let resp = get(st, "/missing.git/info/refs?service=git-upload-pack").await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let logs = logs.read();
+    assert_eq!(1, logs.matches(" WARN ").count(), "{logs}");
+    assert!(logs.contains("ensure_fresh failed"), "{logs}");
+    let scraped = metrics.gather();
+    assert!(
+        scraped.contains(r#"op="clone",repo="-",result="error""#),
+        "{scraped}"
+    );
 }
 
 #[tokio::test]
@@ -346,14 +436,8 @@ fn state(auth: Arc<Auth>) -> AppState {
     let cache_root = std::env::temp_dir().join("git-cache-proxy-tests-unused");
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
+        ..helpers::test_git_config()
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
