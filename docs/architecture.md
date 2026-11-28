@@ -65,8 +65,18 @@ EOF, connection resets/timeouts, temporary DNS failures, and HTTP 408, 429,
 500, 502, 503, and 504. Authentication, missing repositories, certificate
 validation, local filesystem errors, and unknown failures are not retried.
 Classification uses Git's English stderr diagnostics; the child locale is fixed
-to `C`. Retry logs contain the operation, attempt, delay, and error category,
-without raw upstream stderr or credentials.
+to `C`. Retry logs contain the operation, attempt, delay, and error category.
+
+An operation that still fails is logged once, as `upstream operation failed`,
+with its operation, `trigger` (`request` or background `refresh`), repo,
+`error_kind`, elapsed time, and a summary of git's stderr. The summary is the
+last 8 lines, capped at 1 KiB, because `remote:` lines are upstream-controlled
+text. Git already strips credentials from URLs in its own diagnostics; the proxy
+repeats that, redacts `Authorization` and `Cookie` values and the credential in
+use, and removes inherited `GIT_TRACE*` and `GIT_CURL_VERBOSE` so trace output
+never reaches stderr. The stderr stays
+out of the returned error, which callers may surface. A cancelled operation (the
+client went away, or shutdown) is logged at debug, not as a failure.
 
 Retries stay inside the existing per-repository lock. Each failed clone's staging
 directory is removed before another attempt; an existing fetch mirror is kept.
@@ -135,9 +145,8 @@ counts as use after successful cache preparation (`ensure_fresh` returning
 Failed, cancelled, and auth-rejected preparation leaves prior successful use
 unchanged, and concurrent completions cannot move the timestamp backwards.
 Refresh itself never records use, so periodic work cannot keep a mirror active
-forever. When disabled, requests neither record usage nor lock refresh state;
-library enabling counts only requests admitted after enabling. Each round
-selects mirrors used within the active window, most recent first.
+forever. When disabled, requests neither record usage nor lock refresh state.
+Each round selects mirrors used within the active window, most recent first.
 
 **Scheduling.** Rounds start every interval, measured from the previous round's
 start. At the round deadline no new repository starts and running fetches

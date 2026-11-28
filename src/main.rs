@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
         max_upload_packs: cfg.max_concurrent_upload_packs,
         pack_threads: cfg.pack_threads,
         pack_window_memory: cfg.pack_window_memory.clone(),
+        refresh: cfg.refresh_config(),
     };
 
     let metrics = Arc::new(metrics::Metrics::new());
@@ -165,11 +166,7 @@ async fn main() -> Result<()> {
         cfg.cache_root.display(),
     );
 
-    let refresher = cache.start_refresh(
-        Duration::from_secs(cfg.refresh_interval_seconds),
-        Duration::from_secs(cfg.refresh_active_window_seconds),
-        cfg.max_concurrent_refreshes,
-    );
+    let refresher = cache.start_refresh();
 
     let shutdown_cache = cache.clone();
     axum::serve(listener, server::router(state))

@@ -59,20 +59,7 @@ async fn reused_mirror_fetches_configured_upstream_for_refs_and_missing_sha() {
 
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
-    let gitcache = GitCache::new(
-        GitConfig {
-            git_binary: "git".into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
-            fetch_ttl: Duration::ZERO,
-            max_wants: 100,
-            max_upload_packs: 0,
-            pack_threads: None,
-            pack_window_memory: None,
-        },
-        metrics.clone(),
-        None,
-    );
+    let gitcache = GitCache::new(helpers::test_git_config(), metrics.clone(), None);
     let mut repo = git_cache_proxy::repo::RepoRef {
         name: "repo.git".into(),
         upstream_url: format!("file://{}", old.path().display()),
@@ -158,16 +145,7 @@ async fn upload_pack_decodes_gzip_encoded_request() {
     // Proxy over the file:// upstream (in-process, driven via `oneshot`).
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
-    let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
-        fetch_ttl: Duration::from_secs(0),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-    };
+    let cfg = helpers::test_git_config();
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
         lfs: Arc::new(Lfs::new(
@@ -287,16 +265,7 @@ async fn serves_want_by_sha_for_unadvertised_pull_ref() {
     // --- Proxy over the file:// upstream. ---
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
-    let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
-        fetch_ttl: Duration::from_secs(0),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-    };
+    let cfg = helpers::test_git_config();
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
         lfs: Arc::new(Lfs::new(
@@ -424,16 +393,7 @@ async fn want_by_sha_fetch_failure_is_recorded_and_degrades_gracefully() {
 
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
-    let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
-        fetch_ttl: Duration::from_secs(0),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-    };
+    let cfg = helpers::test_git_config();
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
         lfs: Arc::new(Lfs::new(
@@ -558,14 +518,8 @@ async fn want_by_sha_pins_are_capped_per_mirror() {
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
-        fetch_ttl: Duration::from_secs(0),
         max_wants: 1, // keep at most one pin per mirror
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
+        ..helpers::test_git_config()
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -703,14 +657,8 @@ async fn caps_want_by_sha_fetch_within_a_single_request() {
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
-        fetch_ttl: Duration::from_secs(0),
         max_wants: 1,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
+        ..helpers::test_git_config()
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -798,14 +746,8 @@ async fn want_by_sha_pins_are_unlimited_when_max_wants_is_zero() {
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
-        fetch_ttl: Duration::from_secs(0),
         max_wants: 0,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
+        ..helpers::test_git_config()
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -870,24 +812,17 @@ async fn want_by_sha_tolerates_object_check_failure() {
     // A git shim that passes everything through except `cat-file`, which fails.
     // It drains stdin first: exiting unread races the query write into EPIPE.
     let shim = work.path().join("git-shim");
-    std::fs::write(
+    helpers::write_test_script(
         &shim,
         "#!/bin/sh\nif [ \"$1\" = cat-file ]; then cat >/dev/null; echo 'fatal: simulated cat-file failure' >&2; exit 1; fi\nexec git \"$@\"\n",
-    )
-    .unwrap();
+    );
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
         git_binary: shim.to_str().unwrap().into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
-        fetch_ttl: Duration::from_secs(0),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
+        ..helpers::test_git_config()
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -943,16 +878,7 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
     // --- Bring up the proxy pointed at the file:// upstream. ---
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
-    let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
-        fetch_ttl: Duration::from_secs(0),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-    };
+    let cfg = helpers::test_git_config();
     // Eviction enabled with an effectively unbounded cap: no mirror is ever
     // evicted, but the on-request index bookkeeping (touch on serve, mark-changed
     // on clone/fetch) runs, which the assertion below checks.
@@ -1458,7 +1384,7 @@ async fn check_upload_pack_disconnect(reset_connection: bool) {
     let bin = tempfile::tempdir().unwrap();
     let pid_file = bin.path().join("grandchild.pid");
     let fake_git = bin.path().join("fake-git");
-    std::fs::write(
+    helpers::write_test_script(
         &fake_git,
         format!(
             "#!/bin/sh\n\
@@ -1469,8 +1395,7 @@ async fn check_upload_pack_disconnect(reset_connection: bool) {
              exec git \"$@\"\n",
             pid_file.display()
         ),
-    )
-    .unwrap();
+    );
     std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
     let proxy = start_proxy_with_git(up.path(), "8m", fake_git.to_str().unwrap()).await;
 
@@ -1521,18 +1446,13 @@ async fn upload_pack_cap_holds_a_slot_until_the_process_exits() {
 
     let dir = tempfile::tempdir().unwrap();
     let fake_git = dir.path().join("fake-git");
-    std::fs::write(&fake_git, "#!/bin/sh\ncat >/dev/null\nexec sleep 30\n").unwrap();
+    helpers::write_test_script(&fake_git, "#!/bin/sh\ncat >/dev/null\nexec sleep 30\n");
     std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
     let cache = GitCache::new(
         GitConfig {
             git_binary: fake_git.to_str().unwrap().into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
-            fetch_ttl: Duration::from_secs(0),
-            max_wants: 100,
             max_upload_packs: 1,
-            pack_threads: None,
-            pack_window_memory: None,
+            ..helpers::test_git_config()
         },
         Arc::new(Metrics::new()),
         None,
@@ -1585,25 +1505,20 @@ async fn upload_pack_runs_with_pack_options() {
     let dir = tempfile::tempdir().unwrap();
     let argv_log = dir.path().join("argv.log");
     let fake_git = dir.path().join("fake-git");
-    std::fs::write(
+    helpers::write_test_script(
         &fake_git,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec git \"$@\"\n",
             argv_log.display()
         ),
-    )
-    .unwrap();
+    );
     std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
     let cache = GitCache::new(
         GitConfig {
             git_binary: fake_git.to_str().unwrap().into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
-            fetch_ttl: Duration::from_secs(0),
-            max_wants: 100,
-            max_upload_packs: 0,
             pack_threads: Some(2),
             pack_window_memory: Some("64m".into()),
+            ..helpers::test_git_config()
         },
         Arc::new(Metrics::new()),
         None,
@@ -1720,13 +1635,8 @@ async fn start_proxy_with_auth(
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
         git_binary: git_binary.into(),
-        upstream_auth_header: None,
         big_file_threshold: big_file_threshold.into(),
-        fetch_ttl: Duration::from_secs(0),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
+        ..helpers::test_git_config()
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),

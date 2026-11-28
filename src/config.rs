@@ -10,6 +10,8 @@ use tokio::time::Instant;
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 
+use crate::git::RefreshConfig;
+
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum LogFormat {
@@ -343,6 +345,15 @@ fn parse_upstream_timeout(value: &str) -> Result<u64, String> {
 }
 
 impl Config {
+    /// Refresh settings, or `None` when `--refresh-interval-seconds` is 0.
+    pub fn refresh_config(&self) -> Option<RefreshConfig> {
+        (self.refresh_interval_seconds != 0).then(|| RefreshConfig {
+            interval: Duration::from_secs(self.refresh_interval_seconds),
+            active_window: Duration::from_secs(self.refresh_active_window_seconds),
+            concurrency: self.max_concurrent_refreshes,
+        })
+    }
+
     /// Validate refresh options before starting background work.
     pub fn validate_refresh(&self) -> Result<()> {
         if self.refresh_interval_seconds != 0 {

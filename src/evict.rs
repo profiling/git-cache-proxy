@@ -473,7 +473,10 @@ mod tests {
 
     use tokio::sync::watch;
 
-    use crate::git::{GitCache, GitConfig};
+    use crate::git::GitCache;
+    use crate::test_util::test_git_config;
+    #[cfg(unix)]
+    use crate::test_util::write_test_script;
 
     #[cfg(unix)]
     #[tokio::test]
@@ -484,17 +487,13 @@ mod tests {
             u64::MAX,
             "printf '%01024d' 0 > objects/pack.data\n",
         );
-        let handle = cache
-            .start_refresh(Duration::from_secs(3600), Duration::from_secs(604800), 1)
-            .unwrap();
+        let handle = cache.start_refresh().unwrap();
         cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
         idx.touch("b.git");
         let before = idx.totals().0;
         cache
             .refresh_repo(
                 &repo,
-                Duration::from_secs(3600),
-                Duration::from_secs(604800),
                 tokio::time::Instant::now() + Duration::from_secs(3600),
             )
             .await;
@@ -527,16 +526,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (cache, idx, repo) =
             refresh_growth_fixture(tmp.path(), 256, "printf '%01024d' 0 > objects/pack.data\n");
-        let handle = cache
-            .start_refresh(Duration::from_secs(3600), Duration::from_secs(604800), 1)
-            .unwrap();
+        let handle = cache.start_refresh().unwrap();
         cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
         idx.touch("b.git");
         cache
             .refresh_repo(
                 &repo,
-                Duration::from_secs(3600),
-                Duration::from_secs(604800),
                 tokio::time::Instant::now() + Duration::from_secs(3600),
             )
             .await;
@@ -567,15 +562,11 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let handle = cache
-            .start_refresh(Duration::from_secs(3600), Duration::from_secs(604800), 1)
-            .unwrap();
+        let handle = cache.start_refresh().unwrap();
         cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
         idx.touch("b.git");
         let refresh = cache.refresh_repo(
             &repo,
-            Duration::from_secs(3600),
-            Duration::from_secs(604800),
             tokio::time::Instant::now() + Duration::from_secs(3600),
         );
         tokio::pin!(refresh);
@@ -681,7 +672,7 @@ mod tests {
 
         let metrics = Arc::new(Metrics::new());
         let idx = CacheIndex::new(root.to_path_buf(), 4096, metrics.clone());
-        let cache = GitCache::new(dummy_cfg(), metrics.clone(), Some(idx.clone()));
+        let cache = GitCache::new(test_git_config(), metrics.clone(), Some(idx.clone()));
         idx.mark_changed("big.git"); // request path would do this after a clone
 
         maintain(&cache, &idx).await; // measures big.git (>cap) then evicts it
@@ -709,7 +700,7 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let idx = CacheIndex::new(root.to_path_buf(), 6000, metrics.clone()); // over cap
         let cache = Arc::new(GitCache::new(
-            dummy_cfg(),
+            test_git_config(),
             metrics.clone(),
             Some(idx.clone()),
         ));
@@ -762,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn evict_is_a_noop_when_the_mirror_is_already_gone() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = GitCache::new(dummy_cfg(), Arc::new(Metrics::new()), None);
+        let cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         // No `HEAD` at this path, so `evict` returns early without touching disk.
         let dir = tmp.path().join("absent.git");
         cache.evict("absent.git", &dir).await.unwrap();
@@ -809,7 +800,7 @@ mod tests {
             "only the blob is tracked, not the in-flight file"
         );
 
-        let cache = GitCache::new(dummy_cfg(), metrics.clone(), Some(idx.clone()));
+        let cache = GitCache::new(test_git_config(), metrics.clone(), Some(idx.clone()));
         maintain(&cache, &idx).await; // over cap -> the blob file is unlinked
         assert!(!blob.exists(), "over-cap LFS blob should be evicted");
         assert_eq!(idx.totals(), (0, 0));
@@ -880,38 +871,20 @@ mod tests {
         make_mirror(&root.join("a.git"), 10, None);
         make_mirror(&root.join("b.git"), 10, None);
         let binary = root.join("git-wrapper");
-        // Avoid writable descriptors inherited by parallel tests' forked children.
-        assert!(
-            std::process::Command::new("sh")
-                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
-                .arg(&binary)
-                .arg(format!("#!/bin/sh\n{script}"))
-                .status()
-                .unwrap()
-                .success()
-        );
+        write_test_script(&binary, &format!("#!/bin/sh\n{script}"));
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let metrics = Arc::new(Metrics::new());
         let idx = CacheIndex::new(root.to_path_buf(), cap, metrics.clone());
-        let mut cfg = dummy_cfg();
+        let mut cfg = test_git_config();
         cfg.git_binary = binary.to_str().unwrap().into();
+        cfg.refresh = Some(crate::git::RefreshConfig {
+            interval: Duration::from_secs(3600),
+            active_window: Duration::from_secs(604800),
+            concurrency: 1,
+        });
         let cache = GitCache::new(cfg, metrics, Some(idx.clone()));
         let repo = crate::repo::resolve("a.git", "https://example.com", root).unwrap();
         (cache, idx, repo)
-    }
-
-    fn dummy_cfg() -> GitConfig {
-        // Eviction never shells out to git, so the binary is irrelevant.
-        GitConfig {
-            git_binary: "git".into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
-            fetch_ttl: Duration::from_secs(10),
-            max_wants: 100,
-            max_upload_packs: 0,
-            pack_threads: None,
-            pack_window_memory: None,
-        }
     }
 
     /// A fake bare mirror: `HEAD` plus a data file summing to at least `data_bytes`.

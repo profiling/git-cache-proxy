@@ -10,39 +10,47 @@ def run(*args):
     return subprocess.check_output(args, text=True).strip()
 
 
-def sync_main(source, remote="origin"):
-    run("git", "fetch", "--no-tags", remote,
+def is_ancestor(older, newer):
+    result = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer],
+                            check=False)
+    if result.returncode != 1:
+        result.check_returncode()
+    return result.returncode == 0
+
+
+def sync_main(source):
+    run("git", "fetch", "--no-tags", "origin",
         "+refs/heads/main:refs/remotes/origin/main",
         "+refs/heads/internal/main:refs/remotes/origin/internal/main")
     run("git", "fetch", "--no-tags", source,
         "+refs/heads/main:refs/remotes/official/main")
-    # Never overwrite internal work accidentally added to the mirror.
-    run("git", "merge-base", "--is-ancestor", "origin/main", "official/main")
-    run("git", "push", remote, "refs/remotes/official/main:refs/heads/main")
-    result = subprocess.run([
-        "git", "merge-base", "--is-ancestor", "official/main", "origin/internal/main"
-    ], check=False)
-    if result.returncode not in (0, 1):
-        result.check_returncode()
-    return result.returncode == 1
+    mirror = run("git", "rev-parse", "refs/remotes/origin/main")
+    internal = run("git", "rev-parse", "refs/remotes/origin/internal/main")
+    upstream = run("git", "rev-parse", "refs/remotes/official/main")
+    if not is_ancestor(mirror, upstream):
+        raise SystemExit(f"Refusing non-fast-forward update of main: {mirror} -> {upstream}")
+    if mirror != upstream:
+        run("git", "push", "--no-follow-tags", "origin", f"{upstream}:refs/heads/main")
+    return upstream, internal, not is_ancestor(upstream, internal)
 
 
 def main():
     repository = os.environ["GITHUB_REPOSITORY"]
     if repository != "profiling/git-cache-proxy":
         raise SystemExit("This workflow only maintains profiling/git-cache-proxy")
-    pending = sync_main("https://github.com/rolandjitsu/git-cache-proxy.git")
-    official_sha = run("git", "rev-parse", "official/main")
-    internal_sha = run("git", "rev-parse", "origin/internal/main")
+    official_sha, internal_sha, pending = sync_main(
+        "https://github.com/rolandjitsu/git-cache-proxy.git")
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as output:
         output.write(f"pending={str(pending).lower()}\n")
         output.write(f"official_sha={official_sha}\n")
         output.write(f"internal_sha={internal_sha}\n")
     if not pending:
         return
+    # A contributor's fork can also have a branch named main.
     existing = run("gh", "pr", "list", "--repo", repository, "--state", "open",
-                   "--base", "internal/main", "--head", "main", "--json", "url",
-                   "--jq", ".[0].url // empty")
+                   "--base", "internal/main", "--head", "main",
+                   "--json", "url,isCrossRepository", "--jq",
+                   "map(select(.isCrossRepository == false)) | .[0].url // empty")
     with tempfile.TemporaryDirectory() as directory:
         body = Path(directory) / "body.md"
         body.write_text(
